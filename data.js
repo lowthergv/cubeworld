@@ -130,6 +130,12 @@ const PROP_BMP = {
   hoopNet: ['1000001','1000001','0100010','0011100'],         // basketball net
 };
 
-const MAX_CUBES = 9;
 const MAX_OCCUPANTS = 4;
 const SLEEP_IDLE = 40000;       // ms of no interaction before a cube dozes off
+
+// ---- LCD tick ----
+// The real toy's screen is a segmented STN panel driven by a slow controller —
+// everything visible steps in discrete whole-dot increments, not smoothly.
+// One LCD_TICK = one such controller step; each cube runs its own tick clock
+// (phase-offset at spawn) so cubes on the table don't visibly lockstep.
+const LCD_TICK = 160;            // ms per LCD controller step

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cube World</title>
-<link rel="stylesheet" href="style.css?v=8">
+<link rel="stylesheet" href="style.css?v=14">
 </head>
 <body>
 <div id="stage">
@@ -12,15 +12,17 @@
 </div>
 
 <div id="bar">
+  <span id="brand">CUBE WORLD<sup>&trade;</sup></span>
   <button id="addCubeBtn" class="btn">+ Cube</button>
   <button id="shakeBtn" class="btn">Shake</button>
   <button id="muteBtn" class="btn is-on">Sound</button>
   <span class="spacer"></span>
+  <span id="hint">drag cubes together &middot; click a figure to poke &middot; deck buttons play</span>
   <button id="resetBtn" class="btn">Reset</button>
 </div>
 
 <script src="sprites.js"></script>
-<script src="data.js?v=12"></script>
-<script src="main.js?v=12"></script>
+<script src="data.js?v=13"></script>
+<script src="main.js?v=14"></script>
 </body>
 </html>
