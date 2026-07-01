@@ -1,0 +1,1228 @@
+(function () {
+  'use strict';
+
+  // ==========================================================================
+  // Radica Cube World — LCD emulator engine
+  // ==========================================================================
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const stage = document.getElementById('stage');
+  const addBtn = document.getElementById('addCubeBtn');
+  const shakeBtn = document.getElementById('shakeBtn');
+  const muteBtn = document.getElementById('muteBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  const GAP = 22;
+  const SNAP = 30;              // px proximity for a magnetic snap
+  const TOL = 2;                // px flush tolerance for a live connection
+  const FRAME_MS = 170;         // per LCD animation frame (choppy toy cadence)
+  const WALK_SPEED = 0.011;     // dot columns per ms
+  const VWALK = 0.017;          // dot rows per ms (rising/dropping through a hatch)
+  // SLEEP_IDLE comes from data.js
+
+  // Small monochrome LCD emote icons (drawn in ON dots above a character).
+  const EMOTES = {
+    exclaim: ['010','010','010','000','010'],
+    note:    ['00110','00101','00100','01100','11100'],
+    heart:   ['01010','11111','11111','01110','00100'],
+    zzz:     ['1110','0010','0100','1110'],
+  };
+
+  // extra idle-variety loops built from the real traced idle-standing frames
+  CW_ANIM.idle2 = [0, 3, 4, 5, 4, 3];
+  CW_ANIM.scratch = [0, 6, 7, 6, 0];
+  // stand-up: the sit sequence [10..15] played back out to standing idle
+  CW_ANIM.stand = [15, 14, 13, 12, 11, 10, 0];
+
+  // ---- shared behaviours every character performs on idle ----------------
+  // `anim` is the clip; `loops` = [min,max] repeats before returning to idle
+  // (so an action dwells instead of snapping back after one cycle). `hold`
+  // sustains a frame for `holdDur` ms after the intro (sit → hold seated),
+  // then `stand` plays as the outro. `emote` shows a small icon while acting.
+  const OPPOSITE = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' };
+  const BEHAVIORS = {
+    lookabout: { anim: 'idle2',   loops: [2, 4] },
+    scratch:   { anim: 'scratch', loops: [1, 3] },
+    stretch:   { anim: 'stretch', loops: [1, 2] },
+    bend:      { anim: 'bend',    loops: [1, 2] },
+    wave:      { anim: 'wave',    loops: [2, 3], emote: 'note' },
+    sit:       { anim: 'sit', hold: 'sitheld', holdDur: [2600, 6500], stand: 'stand' },
+  };
+  const IDLE_ACTS = Object.keys(BEHAVIORS);
+
+  let CSS_W = 1000, CSS_H = 600;
+  let dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  let cubes = [], cubeSeq = 1;
+  let chars = [], charSeq = 1;
+
+  let muted = false, audioCtx = null, drag = null, matrixTile = null;
+  let last = null, animClock = 0;
+
+  // ------------------------------------------------------------- utilities
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const irand = (a, b) => Math.floor(rand(a, b));
+  const pick = a => a[(Math.random() * a.length) | 0];
+  const overlap = (a0, a1, b0, b1) => Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+  const cubeById = id => cubes.find(c => c.id === id);
+  // step `cur` toward `target` by up to speed*dt, snapping on when it would
+  // reach/overshoot — so movement lands cleanly regardless of frame length.
+  const toward = (cur, target, speed, dt) => {
+    const d = target - cur, step = speed * dt;
+    return Math.abs(d) <= step ? target : cur + Math.sign(d) * step;
+  };
+
+  function shuffled(a) {
+    a = a.slice();
+    for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [a[i], a[j]] = [a[j], a[i]]; }
+    return a;
+  }
+  function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  // ----------------------------------------------------------------- audio
+  function ensureAudio() {
+    if (!audioCtx) { const C = window.AudioContext || window.webkitAudioContext; if (C) audioCtx = new C(); }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function beep(freq, dur, delay, vol, type) {
+    if (muted || !audioCtx) return;
+    const t0 = audioCtx.currentTime + (delay || 0);
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol == null ? 0.05 : vol, t0 + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+  const sfx = {
+    poke:    () => beep(880, 0.08),
+    connect: () => { beep(523, 0.05); beep(659, 0.05, 0.05); beep(784, 0.09, 0.1); },
+    transfer:() => { beep(494, 0.05); beep(740, 0.06, 0.05); },
+    greet:   () => { beep(660, 0.06); beep(880, 0.08, 0.06); },
+    dizzy:   () => { beep(400, 0.1, 0, 0.05, 'sawtooth'); beep(300, 0.12, 0.08, 0.05, 'sawtooth'); },
+    add:     () => { beep(587, 0.05); beep(880, 0.08, 0.05); },
+    dissolve:() => { beep(700, 0.05); beep(440, 0.08, 0.05); },
+  };
+
+  // ----------------------------------------------------------- world model
+  // Draw characters from a shuffled bag so a session shows varied, non-repeating
+  // characters (and surfaces Special Editions) before any repeat.
+  let rosterBag = [];
+  function nextRoster() { if (!rosterBag.length) rosterBag = shuffled(ROSTER); return rosterBag.pop(); }
+
+  function makeChar(cube, def) {
+    const id = charSeq++;
+    const ch = {
+      id, ident: def, trick: def.trick,
+      homeId: cube.id, cubeId: cube.id,
+      x: rand(9, 23), lane: 0, laneCount: 1,
+      facing: Math.random() < 0.5 ? -1 : 1,
+      restAnim: Math.random() < 0.5 ? 'idle' : 'idle2',
+      state: 'idle',
+      anim: 'idle', frame: 0, frameT: 0, oneShot: null,
+      act: null,                     // active shared behaviour (sit/wave/…)
+      think: rand(600, 2000),
+      emote: null,
+      dizzy: 0,
+      trickT: 0, trickDur: 0,
+      transEdge: null, transAxis: 'h', transPhase: null, enterEdge: null,
+      yOff: 0,                       // vertical offset while using a hatch
+    };
+    chars.push(ch);
+    cube.occupants.push(ch.id);
+    return ch;
+  }
+
+  function makeCube(x, y) {
+    const def = nextRoster();
+    const cube = {
+      id: cubeSeq++,
+      housing: def,            // full roster def carries colour + identity
+      icon: GAME_ICON[def.trick] || 'star',
+      scene: def.id === 'global' ? 'beach' : def.id === 'blockbash' ? 'city' : null,
+      jumbo: !!def.jumbo,
+      x, y,
+      conn: { top: null, bottom: null, left: null, right: null },
+      occupants: [],
+      blind: 0,            // 0 open .. 1 fully closed (Venetian blind)
+      door: { left: 0, right: 0, top: 0, bottom: 0 },  // 0 shut .. 1 open (per edge)
+      wiggle: 0,
+      idle: 0,             // ms since last interaction (for sleep)
+      asleep: false,
+      boot: { t: 0, dur: 2100 },   // power-on maze wipe-on animation
+      toast: null,         // transient "game name" caption under the screen
+      plane: new Uint8Array(LCD * LCD),
+      _occSig: '',
+    };
+    cubes.push(cube);
+    makeChar(cube, def);
+    return cube;
+  }
+
+  function occupantsOf(cube) {
+    return cube.occupants.map(id => chars.find(c => c.id === id)).filter(Boolean);
+  }
+
+  // ---- connection detection (magnetic sides, flush edges) ----
+  function recomputeConnections() {
+    for (const c of cubes) c.conn = { top: null, bottom: null, left: null, right: null };
+    for (let i = 0; i < cubes.length; i++) {
+      for (let j = i + 1; j < cubes.length; j++) {
+        const A = cubes[i], B = cubes[j];
+        const oy = overlap(A.y, A.y + CUBE_SIZE, B.y, B.y + CUBE_SIZE);
+        const ox = overlap(A.x, A.x + CUBE_SIZE, B.x, B.x + CUBE_SIZE);
+        if (oy >= CUBE_SIZE * 0.85) {
+          if (Math.abs((A.x + CUBE_SIZE) - B.x) < TOL) { A.conn.right = B.id; B.conn.left = A.id; }
+          else if (Math.abs((B.x + CUBE_SIZE) - A.x) < TOL) { B.conn.right = A.id; A.conn.left = B.id; }
+        }
+        if (ox >= CUBE_SIZE * 0.85) {
+          if (Math.abs((A.y + CUBE_SIZE) - B.y) < TOL) { A.conn.bottom = B.id; B.conn.top = A.id; }
+          else if (Math.abs((B.y + CUBE_SIZE) - A.y) < TOL) { B.conn.bottom = A.id; A.conn.top = B.id; }
+        }
+      }
+    }
+  }
+  const cubeConnected = c => c.conn.top || c.conn.bottom || c.conn.left || c.conn.right;
+  function connectionCount() { let n = 0; for (const c of cubes) { if (c.conn.right) n++; if (c.conn.bottom) n++; } return n; }
+  function connectedEdges(cube) {
+    const e = [];
+    for (const k of ['top', 'bottom', 'left', 'right']) if (cube.conn[k]) e.push(k);
+    return e;
+  }
+
+  // ---- dissolve: any character not in its home cube snaps back ----
+  function dissolveOrphans() {
+    for (const ch of chars) {
+      if (ch.cubeId === ch.homeId) continue;
+      const cur = cubeById(ch.cubeId), home = cubeById(ch.homeId);
+      if (!cur || !home) continue;
+      // still reachable through a live connection? if not, dissolve home.
+      if (!pathConnected(ch.cubeId, ch.homeId)) {
+        const idx = cur.occupants.indexOf(ch.id);
+        if (idx >= 0) cur.occupants.splice(idx, 1);
+        if (!home.occupants.includes(ch.id)) home.occupants.push(ch.id);
+        ch.cubeId = ch.homeId;
+        ch.state = 'idle'; ch.anim = 'idle'; ch.frame = 0;
+        ch.act = null; ch.oneShot = null; ch.yOff = 0; ch.transPhase = null;
+        ch.x = rand(9, 23);
+        ch.emote = null;
+        sfx.dissolve();
+      }
+    }
+  }
+  function pathConnected(aId, bId) {
+    if (aId === bId) return true;
+    const seen = new Set([aId]); const stack = [aId];
+    while (stack.length) {
+      const c = cubeById(stack.pop());
+      for (const k of ['top', 'bottom', 'left', 'right']) {
+        const n = c.conn[k];
+        if (n && !seen.has(n)) { if (n === bId) return true; seen.add(n); stack.push(n); }
+      }
+    }
+    return false;
+  }
+
+  // ------------------------------------------------------------- placement
+  function findSpot() {
+    // Auto-tile into a grid that grows downward — cubes are unlimited, so the
+    // sandbox scrolls once a row runs past the viewport.
+    const cols = Math.max(1, Math.floor((CSS_W - GAP) / (CUBE_SIZE + GAP)));
+    for (let r = 0; r < 400; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = GAP + c * (CUBE_SIZE + GAP), y = GAP + r * (CUBE_SIZE + GAP);
+        const free = cubes.every(k => !(x < k.x + CUBE_SIZE + 8 && x + CUBE_SIZE + 8 > k.x &&
+          y < k.y + CUBE_SIZE + 8 && y + CUBE_SIZE + 8 > k.y));
+        if (free) return { x, y };
+      }
+    }
+    return null;
+  }
+  function addCube() {
+    const spot = findSpot();
+    if (!spot) return null;
+    const cube = makeCube(spot.x, spot.y);
+    recomputeConnections();
+    resize();          // grow the sandbox if the grid pushed past the viewport
+    return cube;
+  }
+  function updateAddBtn() { /* unlimited cubes — button never disables */ }
+  function initWorld() { for (let i = 0; i < 4; i++) addCube(); }
+
+  // =========================================================== CHARACTER AI
+  function setAnim(ch, name, oneShot) {
+    if (ch.anim !== name || oneShot) { ch.anim = name; ch.frame = 0; ch.frameT = 0; }
+    ch.oneShot = oneShot || null;
+  }
+
+  function neighborThrough(cube, edge) { return cube.conn[edge] ? cubeById(cube.conn[edge]) : null; }
+
+  // ---- lane layout so co-occupants never overlap on the 32-wide screen ----
+  // Present = occupants not currently walking out. Lanes are keyed by id so a
+  // character keeps a stable lane (no index-swap jitter as they cross).
+  function presentOccupants(cube) {
+    return cube.occupants
+      .map(id => chars.find(c => c.id === id))
+      .filter(c => c && c.state !== 'transfer');
+  }
+  function layoutCube(cube) {
+    const present = presentOccupants(cube).sort((a, b) => a.id - b.id);
+    present.forEach((c, i) => { c.lane = i; c.laneCount = present.length; });
+  }
+  function laneX(ch) {
+    const n = ch.laneCount || 1;
+    if (n <= 1) return null;             // solo → free to roam the whole screen
+    const lo = 5, hi = 27;               // spread lanes wide across the usable width
+    return lo + (hi - lo) * (ch.lane + 0.5) / n;
+  }
+
+  // ---- doorway occupancy: a door/hatch is shared by two cubes, so only one
+  // character may pass through it at a time (this is what stops figures from
+  // crossing through each other mid-transfer) --------------------------------
+  function edgeActive(cube, edge) {
+    return occupantsOf(cube).some(ch =>
+      (ch.state === 'transfer' && ch.transEdge === edge) ||
+      (ch.state === 'entering' && ch.enterEdge === edge));
+  }
+  function pairBusy(cube, edge) {
+    if (edgeActive(cube, edge)) return true;
+    const nb = neighborThrough(cube, edge);
+    return !!(nb && edgeActive(nb, OPPOSITE[edge]));
+  }
+
+  // start walking a character out through `edge` into the neighbour.
+  // Phase 'approach' = walk to the door sill; 'cross' = pass through once open.
+  function beginTransfer(ch, cube, edge) {
+    ch.state = 'transfer';
+    ch.transEdge = edge;
+    ch.transPhase = 'approach';
+    ch.act = null; ch.oneShot = null; ch.yOff = 0;
+    setAnim(ch, 'walk');
+    if (edge === 'left' || edge === 'right') {
+      ch.transAxis = 'h';
+      if (edge === 'right') { ch.facing = 1; ch.threshX = LCD - 6; ch.exitX = LCD + 4; }
+      else { ch.facing = -1; ch.threshX = 5; ch.exitX = -4; }
+    } else {                                   // vertical: rise/drop through a hatch
+      ch.transAxis = 'v';
+      ch.facing = ch.x < CENTER_X ? 1 : -1;
+      ch.vdir = edge === 'top' ? -1 : 1;       // up through the ceiling / down through the floor
+      ch.exitYOff = edge === 'top' ? -24 : 16;
+    }
+    wakeCube(cube);
+  }
+  function completeTransfer(ch, fromCube, edge) {
+    const dest = neighborThrough(fromCube, edge);
+    // no room next door → turn around and walk back in through the same door
+    if (!dest || dest.occupants.length >= MAX_OCCUPANTS) {
+      ch.state = 'entering'; ch.enterEdge = edge; setAnim(ch, 'walk');
+      if (ch.transAxis === 'h') { ch.x = ch.exitX; ch.facing = -ch.facing; }
+      else { ch.x = CENTER_X; ch.yOff = ch.exitYOff; }
+      layoutCube(fromCube);
+      const lx0 = laneX(ch); ch.target = (lx0 == null) ? irand(10, 22) : lx0;
+      return;
+    }
+    const fi = fromCube.occupants.indexOf(ch.id);
+    if (fi >= 0) fromCube.occupants.splice(fi, 1);
+    dest.occupants.push(ch.id);
+    ch.cubeId = dest.id;
+    const opp = OPPOSITE[edge];
+    ch.state = 'entering'; ch.enterEdge = opp; setAnim(ch, 'walk');
+    if (ch.transAxis === 'h') {
+      ch.yOff = 0;
+      if (opp === 'left') { ch.x = -4; ch.facing = 1; }
+      else { ch.x = LCD + 4; ch.facing = -1; }
+    } else {                                   // enter via the opposite hatch
+      ch.x = CENTER_X;
+      ch.yOff = opp === 'top' ? -24 : 16;      // drop from the ceiling / rise from the floor
+    }
+    layoutCube(fromCube); layoutCube(dest);
+    const lx = laneX(ch);
+    ch.target = (lx == null) ? irand(10, 22) : lx;
+    dest.idle = 0; dest.asleep = false;
+    sfx.transfer();
+  }
+
+  function wakeCube(cube) { cube.idle = 0; cube.asleep = false; }
+
+  function updateChar(ch, dt) {
+    const cube = cubeById(ch.cubeId);
+    if (!cube) return;
+
+    // advance animation frames
+    ch.frameT += dt;
+    if (ch.frameT >= FRAME_MS) {
+      ch.frameT -= FRAME_MS;
+      const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
+      ch.frame++;
+      if (ch.frame >= seq.length) {
+        ch.frame = 0;
+        if (ch.state === 'acting' && ch.act) onActLoop(ch);        // looped behaviour
+        else if (ch.oneShot) { ch.oneShot = null; if (ch.state === 'acting') { ch.state = 'idle'; setAnim(ch, 'idle'); } }
+      }
+    }
+
+    if (cube.asleep) { setAnim(ch, 'idle'); return; }
+
+    // dizzy overrides
+    if (ch.dizzy > 0) {
+      ch.dizzy -= dt;
+      ch.state = 'dizzy'; setAnim(ch, 'dizzy');
+      if (ch.dizzy <= 0) { ch.state = 'idle'; setAnim(ch, 'idle'); }
+      return;
+    }
+
+    if (ch.state === 'transfer') {
+      const door = cube.door[ch.transEdge];
+      if (ch.transAxis === 'h') {
+        if (ch.transPhase === 'approach') {                 // walk to the door sill
+          ch.facing = ch.threshX < ch.x ? -1 : 1;
+          ch.x = toward(ch.x, ch.threshX, WALK_SPEED, dt);
+          if (ch.x === ch.threshX) ch.transPhase = 'cross';
+        } else if (door > 0.55) {                            // step through once it's open
+          ch.x += ch.facing * WALK_SPEED * dt;
+          if ((ch.facing < 0 && ch.x <= ch.exitX) || (ch.facing > 0 && ch.x >= ch.exitX))
+            completeTransfer(ch, cube, ch.transEdge);
+        }
+      } else {                                              // vertical: centre under the hatch, then rise/drop
+        if (ch.transPhase === 'approach') {
+          ch.facing = CENTER_X < ch.x ? -1 : 1;
+          ch.x = toward(ch.x, CENTER_X, WALK_SPEED, dt);
+          if (ch.x === CENTER_X) ch.transPhase = 'cross';
+        } else if (door > 0.55) {
+          ch.yOff += ch.vdir * VWALK * dt;
+          if ((ch.vdir < 0 && ch.yOff <= ch.exitYOff) || (ch.vdir > 0 && ch.yOff >= ch.exitYOff))
+            completeTransfer(ch, cube, ch.transEdge);
+        }
+      }
+      return;
+    }
+    if (ch.state === 'entering') {
+      if (ch.transAxis === 'v' && ch.yOff !== 0) {           // settle onto the floor first
+        ch.yOff = toward(ch.yOff, 0, VWALK, dt);
+        return;
+      }
+      ch.yOff = 0;
+      ch.facing = ch.target < ch.x ? -1 : 1;
+      ch.x = toward(ch.x, ch.target, WALK_SPEED, dt);
+      if (ch.x === ch.target) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = rand(700, 2200); }
+      return;
+    }
+    if (ch.state === 'walking') {
+      ch.facing = ch.target < ch.x ? -1 : 1;
+      ch.x = toward(ch.x, ch.target, WALK_SPEED, dt);
+      if (ch.x === ch.target) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = rand(700, 2200); }
+      return;
+    }
+    if (ch.state === 'acting') {                    // a looped behaviour (sit/wave/…)
+      const a = ch.act;
+      if (a && a.phase === 'hold') {                // sustain the pose (e.g. stay seated)
+        a.holdT += dt;
+        if (a.holdT >= a.holdDur) {
+          const b = BEHAVIORS[a.key];
+          if (b.stand) { a.phase = 'stand'; setAnim(ch, b.stand, true); }
+          else finishAct(ch);
+        }
+      }
+      return;
+    }
+    if (ch.state === 'interacting') { ch.think -= dt; if (ch.think <= 0) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.emote = null; } return; }
+    if (ch.state === 'trick') {                     // performing signature move
+      ch.trickT += dt;
+      if (ch.trickT >= ch.trickDur) { ch.state = 'idle'; setAnim(ch, 'idle'); }
+      return;
+    }
+
+    // ---- idle ----
+    ch.state = 'idle';
+    // settle into assigned lane when sharing a screen (prevents overlap)
+    const lx = laneX(ch);
+    if (lx != null && Math.abs(ch.x - lx) > 0.6) {
+      ch.facing = ch.x < lx ? 1 : -1;
+      ch.x = toward(ch.x, lx, WALK_SPEED, dt);
+      setAnim(ch, 'walk');
+      return;
+    }
+    if (ch.anim === 'walk') setAnim(ch, ch.restAnim);
+
+    ch.think -= dt;
+    if (ch.think > 0) return;
+    ch.think = rand(320, 1150);                    // real figures act almost constantly
+
+    const edges = connectedEdges(cube);
+    const solo = lx == null;
+    const roll = Math.random();
+    // the real cubes are usually mid-game: a solo character plays its game often
+    const gameChance = solo ? 0.5 : 0.2;
+    if (TRICKS[ch.trick] && roll < gameChance) { startTrick(ch, cube); return; }
+    if (edges.length && roll < gameChance + 0.12) {
+      // only take a door that isn't already in use (prevents crossing figures)
+      const open = edges.filter(e => {
+        const n = neighborThrough(cube, e);
+        return n && n.occupants.length < MAX_OCCUPANTS && !pairBusy(cube, e);
+      });
+      if (open.length) { beginTransfer(ch, cube, pick(open)); return; }
+    }
+    if (roll < gameChance + 0.30) {                // step / short stroll (in place if sharing)
+      const home = solo ? irand(6, 26) : lx;
+      ch.state = 'walking'; ch.target = clamp(Math.round(home + rand(-4, 4)), 5, 27);
+      setAnim(ch, 'walk');
+      return;
+    }
+    startAct(ch, pick(IDLE_ACTS));                 // shared looping behaviour
+  }
+
+  // ---- shared looping-behaviour runner -----------------------------------
+  function startAct(ch, key) {
+    const b = BEHAVIORS[key];
+    ch.state = 'acting';
+    ch.oneShot = null;
+    ch.act = { key, phase: 'play', loops: b.loops ? irand(b.loops[0], b.loops[1] + 1) : 1, holdT: 0, holdDur: 0 };
+    setAnim(ch, b.anim, true);
+    ch.emote = b.emote ? { icon: b.emote, t: 900 } : null;
+  }
+  function onActLoop(ch) {                          // called whenever the clip wraps
+    const a = ch.act, b = BEHAVIORS[a.key];
+    if (a.phase === 'play') {
+      if (--a.loops > 0) return;                    // keep repeating the clip
+      if (b.hold) { a.phase = 'hold'; a.holdT = 0; a.holdDur = rand(b.holdDur[0], b.holdDur[1]); setAnim(ch, b.hold); }
+      else finishAct(ch);
+    } else if (a.phase === 'stand') {               // outro finished
+      finishAct(ch);
+    }
+  }
+  function finishAct(ch) {
+    ch.act = null; ch.oneShot = null;
+    ch.state = 'idle'; setAnim(ch, 'idle');
+    ch.think = rand(500, 1600);
+  }
+
+  const BODY_TO_ANIM = { jump: 'idle', dance: 'wave', kick: 'walk' };
+  function bodyToAnim(b) { return BODY_TO_ANIM[b] || (CW_ANIM[b] ? b : 'idle'); }
+  function startTrick(ch, cube) {
+    const t = TRICKS[ch.trick];
+    if (!t) return;
+    ch.act = null;
+    ch.state = 'trick'; ch.trickT = 0; ch.trickDur = 2800;
+    setAnim(ch, bodyToAnim(t.body), true);
+    ch.emote = null;
+    cube.toast = { text: t.game, t: 3200 };
+    wakeCube(cube);
+    sfx.greet();
+  }
+
+  // co-occupants in adjacent lanes turn to greet each other (they're already
+  // spaced apart, so no overlap — they wave across the gap)
+  function detectInteractions() {
+    const groups = new Map();
+    for (const ch of chars) {
+      if (ch.state !== 'idle' || cubeById(ch.cubeId).asleep) continue;
+      if (!groups.has(ch.cubeId)) groups.set(ch.cubeId, []);
+      groups.get(ch.cubeId).push(ch);
+    }
+    for (const [, list] of groups) {
+      if (list.length < 2) continue;
+      for (let i = 0; i < list.length; i++)
+        for (let j = i + 1; j < list.length; j++) {
+          const a = list[i], b = list[j];
+          if (Math.random() < 0.03) {
+            a.facing = b.x >= a.x ? 1 : -1; b.facing = a.x >= b.x ? 1 : -1;
+            a.state = b.state = 'interacting';
+            setAnim(a, 'wave', true); setAnim(b, 'wave', true);
+            a.think = b.think = 1200;
+            const icon = pick(['heart', 'note', 'exclaim']);
+            a.emote = { icon, t: 1200 };
+            sfx.greet();
+          }
+        }
+    }
+  }
+
+  function updateChars(dt) {
+    for (const cube of cubes) layoutCube(cube);     // keep lanes fresh
+    for (const ch of chars) {
+      updateChar(ch, dt);
+      if (ch.emote) { ch.emote.t -= dt; if (ch.emote.t <= 0) ch.emote = null; }
+    }
+    detectInteractions();
+  }
+
+  function updateCubes(dt) {
+    for (const cube of cubes) {
+      if (cube.wiggle > 0) cube.wiggle = Math.max(0, cube.wiggle - dt);
+      // power-on boot wipe
+      if (cube.boot) { cube.boot.t += dt; if (cube.boot.t >= cube.boot.dur) cube.boot = null; }
+      // doors / hatches open while a character is crossing that edge, else shut
+      for (const edge of ['left', 'right', 'top', 'bottom']) {
+        const dt2 = edgeActive(cube, edge) ? 1 : 0;
+        cube.door[edge] += clamp(dt2 - cube.door[edge], -1, 1) * Math.min(1, dt / 150);
+      }
+      // Venetian blind lowers over an emptied, still-connected cube
+      const target = (cube.occupants.length === 0 && cubeConnected(cube)) ? 1 : 0;
+      cube.blind += clamp(target - cube.blind, -1, 1) * Math.min(1, dt / 260);
+      // sleep timer
+      cube.idle += dt;
+      if (!cube.asleep && cube.idle > SLEEP_IDLE) cube.asleep = true;
+      // game-name caption
+      if (cube.toast) { cube.toast.t -= dt; if (cube.toast.t <= 0) cube.toast = null; }
+    }
+  }
+
+  function pokeCube(cube) {
+    wakeCube(cube);
+    cube.wiggle = 320;
+    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer');
+    if (occ.length) {
+      const ch = pick(occ);
+      // a poke often coaxes out the character's signature trick
+      if (Math.random() < 0.5 && TRICKS[ch.trick]) { startTrick(ch, cube); }
+      else {
+        ch.act = null; ch.state = 'acting'; setAnim(ch, pick(['mad', 'wave', 'bend']), true);
+        ch.emote = { icon: 'exclaim', t: 700 };
+        ch.think = 700;
+      }
+    }
+    sfx.poke();
+  }
+
+  function shakeAll() {
+    ensureAudio();
+    for (const cube of cubes) { cube.wiggle = 500; wakeCube(cube); }
+    for (const ch of chars) { ch.act = null; ch.yOff = 0; ch.dizzy = rand(1400, 2200); ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.emote = null; }
+    sfx.dizzy();
+  }
+
+  // ================================================================ RENDER
+  function buildMatrixTile() {
+    // one dot cell: pale panel with a subtly lighter centre → dot-matrix grid
+    const t = document.createElement('canvas');
+    t.width = DOT; t.height = DOT;
+    const c = t.getContext('2d');
+    c.fillStyle = LCD_OFF; c.fillRect(0, 0, DOT, DOT);
+    c.fillStyle = LCD_OFF_HI; c.fillRect(0, 0, DOT - 1, DOT - 1);
+    c.fillStyle = 'rgba(0,0,0,0.05)'; c.fillRect(DOT - 1, 0, 1, DOT); c.fillRect(0, DOT - 1, DOT, 1);
+    matrixTile = ctx.createPattern(t, 'repeat');
+  }
+
+  function blitFrame(plane, frameIndex, cx, baseY, facing) {
+    const f = CW_FRAMES[frameIndex];
+    if (!f) return;
+    const left = Math.round(cx - f.w / 2);
+    const top = baseY - f.h + 1;
+    for (let j = 0; j < f.h; j++) {
+      const row = f.rows[j];
+      for (let i = 0; i < f.w; i++) {
+        if (row.charCodeAt(i) === 49) { // '1'
+          const px = facing < 0 ? left + (f.w - 1 - i) : left + i;
+          const py = top + j;
+          if (px >= 0 && px < LCD && py >= 0 && py < LCD) plane[py * LCD + px] = 1;
+        }
+      }
+    }
+  }
+
+  function blitIcon(plane, icon, cx, topY) {
+    const bmp = EMOTES[icon]; if (!bmp) return;
+    const w = bmp[0].length, left = Math.round(cx - w / 2);
+    for (let j = 0; j < bmp.length; j++)
+      for (let i = 0; i < w; i++)
+        if (bmp[j].charCodeAt(i) === 49) {
+          const px = left + i, py = topY + j;
+          if (px >= 0 && px < LCD && py >= 0 && py < LCD) plane[py * LCD + px] = 1;
+        }
+  }
+
+  // ---- signature-trick props (procedural LCD pixel art) ------------------
+  function setOn(plane, x, y) {
+    x = Math.round(x); y = Math.round(y);
+    if (x >= 0 && x < LCD && y >= 0 && y < LCD) plane[y * LCD + x] = 1;
+  }
+  function stamp(plane, bmp, x, y) {
+    for (let j = 0; j < bmp.length; j++)
+      for (let i = 0; i < bmp[j].length; i++)
+        if (bmp[j].charCodeAt(i) === 49) setOn(plane, x + i, y + j);
+  }
+  function disc(plane, cx, cy, r) {
+    for (let y = -r; y <= r; y++) for (let x = -r; x <= r; x++)
+      if (x * x + y * y <= r * r + 1) setOn(plane, cx + x, cy + y);
+  }
+
+  // each drawer: (plane, ch, ph) where ph is trick progress 0..1
+  const PROP = {
+    dog(p, ch, ph) { const bob = Math.round(Math.abs(Math.sin(ph * 7 * Math.PI)) * 2);
+      stamp(p, PROP_BMP.dog, Math.round(ch.x + ch.facing * 8 - 3), FLOOR_Y - 3 - bob); },
+    alien(p, ch, ph) { const ax = ch.x - 11 + ph * 22;
+      stamp(p, PROP_BMP.alien, Math.round(ax - 2), FLOOR_Y - 4);
+      const sx = Math.round(ch.x + ch.facing * 5); for (let y = 0; y < 6; y++) setOn(p, sx, FLOOR_Y - 13 + y); },
+    header(p, ch, ph) { const by = FLOOR_Y - 23 - Math.round(Math.abs(Math.sin(ph * 5 * Math.PI)) * 4); disc(p, Math.round(ch.x), by, 1); },
+    rope(p, ch, ph) { const s = Math.sin(ph * 6 * Math.PI), hy = FLOOR_Y - 10;
+      for (let i = -7; i <= 7; i++) { const t = i / 7, a = Math.sqrt(Math.max(0, 1 - t * t));
+        setOn(p, ch.x + i, s > 0 ? hy - a * 11 : FLOOR_Y + 1 - a * 2); }
+      setOn(p, ch.x - 6, hy); setOn(p, ch.x + 6, hy); },
+    notes(p, ch, ph) { for (let k = 0; k < 3; k++) { const kp = (ph * 2 + k / 3) % 1;
+      stamp(p, EMOTES.note, Math.round(ch.x + ch.facing * 6 + (k - 1) * 2 - 2), Math.round(FLOOR_Y - 16 - kp * 10)); } },
+    block(p, ch, ph) { const bx = Math.round(ch.x + ch.facing * 7);
+      if (ph < 0.55) stamp(p, ['111', '111', '111'], bx, FLOOR_Y - 6);
+      else { const g = Math.round((ph - 0.55) * 10); stamp(p, ['11', '11', '11'], bx - g, FLOOR_Y - 6); stamp(p, ['11', '11', '11'], bx + 2 + g, FLOOR_Y - 6); } },
+    mole(p, ch, ph) { const bx = Math.round(ch.x + ch.facing * 7), swing = Math.sin(ph * 4 * Math.PI);
+      if (swing > 0) stamp(p, PROP_BMP.mole, bx, FLOOR_Y - 4);
+      const hy = FLOOR_Y - 14 + (swing < 0 ? 6 : 0); setOn(p, bx + 1, hy - 1); stamp(p, ['111'], bx, hy); },
+    fly(p, ch, ph) { const fx = ch.x + ch.facing * 6 + Math.cos(ph * 12 * Math.PI) * 4,
+      fy = FLOOR_Y - 14 + Math.sin(ph * 10 * Math.PI) * 5; setOn(p, fx, fy); setOn(p, fx + 1, fy); },
+    door(p, ch, ph) { stamp(p, PROP_BMP.door, Math.round(ch.x + ch.facing * 7 + ph * 3), FLOOR_Y - 8); },
+    fire(p, ch, ph) { const fx = Math.round(ch.x + ch.facing * 9), sz = Math.max(0, 3 - Math.round(ph * 3));
+      for (let k = 0; k <= sz; k++) { setOn(p, fx, FLOOR_Y - 1 - k); if (k < sz) { setOn(p, fx - 1, FLOOR_Y - 1 - k); setOn(p, fx + 1, FLOOR_Y - 1 - k); } }
+      for (let t = 0; t <= 6; t++) if (((t + Math.floor(ph * 16)) % 2) === 0) setOn(p, ch.x + ch.facing * (3 + t), FLOOR_Y - 12 + t * t * 0.28); },
+    paper(p, ch, ph) { for (let k = 0; k < 3; k++) { const kp = (ph * 1.5 + k / 3) % 1;
+      stamp(p, PROP_BMP.paper, Math.round(ch.x + ch.facing * 7 + (k - 1) * 3 - 2), Math.round(FLOOR_Y - 18 + kp * 16)); } },
+    dogbite(p, ch, ph) { const bob = Math.round(Math.abs(Math.sin(ph * 8 * Math.PI)) * 2);
+      stamp(p, PROP_BMP.dog, Math.round(ch.x - ch.facing * 7 - 3), FLOOR_Y - 3 - bob); },
+    bat(p, ch, ph) { const hx = ch.x + ch.facing * 4, hy = FLOOR_Y - 12, ang = -1.2 + ph * 2.2;
+      for (let r = 0; r < 7; r++) setOn(p, hx + ch.facing * Math.cos(ang) * r, hy + Math.sin(ang) * r);
+      if (ph > 0.7) disc(p, ch.x + ch.facing * (6 + (ph - 0.7) * 30), FLOOR_Y - 16, 1); },
+    ball(p, ch, ph) { disc(p, ch.x + ch.facing * (4 + ph * 22), FLOOR_Y - 2 - Math.sin(ph * Math.PI) * 14, 1); },
+    hoop(p, ch, ph) { const nx = Math.round(ch.x + ch.facing * 9); stamp(p, PROP_BMP.hoopNet, nx - 3, FLOOR_Y - 22);
+      const bx = ch.x + (ch.facing * 9) * ph, by = (FLOOR_Y - 14) + (-6) * ph - Math.sin(ph * Math.PI) * 4; disc(p, bx, by, 1); },
+    board(p, ch, ph) { const bx = Math.round(ch.x + Math.sin(ph * 2 * Math.PI) * 3); stamp(p, PROP_BMP.board, bx - 3, FLOOR_Y - 1); },
+    water(p, ch, ph) { for (let x = 2; x < 30; x++) setOn(p, x, FLOOR_Y - 1 + Math.sin(x * 0.6 + ph * 8));
+      for (let k = 0; k < 3; k++) { const kp = (ph * 2 + k / 3) % 1; setOn(p, ch.x + ch.facing * 5 + k * 2, FLOOR_Y - 2 - kp * 10); } },
+    rocket(p, ch, ph) { const rx = ch.x + ch.facing * 4 + ph * 10, ry = FLOOR_Y - 8 - ph * 20;
+      stamp(p, ['010', '111', '111', '101'], Math.round(rx - 1), Math.round(ry));
+      for (let k = 1; k <= 3; k++) setOn(p, rx, ry + 4 + k);
+      setOn(p, 5, 6); setOn(p, 26, 4); setOn(p, 20, 9); setOn(p, 9, 3); },
+    snake(p, ch, ph) { const bx = Math.round(ch.x + ch.facing * 7), h = Math.round(4 + ph * 10);
+      for (let y = 0; y < h; y++) setOn(p, bx + Math.sin(y * 0.6 + ph * 10) * 1.5, FLOOR_Y - 2 - y);
+      stamp(p, ['111', '101', '111'], bx - 1, FLOOR_Y - 2); },
+    globe(p, ch, ph) { const gx = Math.round(ch.x + ch.facing * 7); stamp(p, PROP_BMP.globe, gx - 2, FLOOR_Y - 18);
+      const a = ph * 2 * Math.PI; setOn(p, gx + Math.cos(a) * 5, FLOOR_Y - 16 + Math.sin(a) * 5); },
+    taxi(p, ch, ph) { stamp(p, PROP_BMP.taxi, Math.round(-6 + ph * 40), FLOOR_Y - 4); },
+  };
+
+  function drawTrick(plane, ch) {
+    const t = TRICKS[ch.trick];
+    const ph = clamp(ch.trickDur ? ch.trickT / ch.trickDur : 0, 0, 1);
+    if (!t) { blitFrame(plane, CW_ANIM.idle[0], ch.x, FLOOR_Y, ch.facing); return; }
+    const seq = CW_ANIM[bodyToAnim(t.body)] || CW_ANIM.idle;
+    const fi = seq[Math.floor(ch.trickT / FRAME_MS) % seq.length];
+    let bob = 0;
+    if (t.body === 'jump') bob = -Math.round(Math.abs(Math.sin(ph * (t.prop === 'rope' ? 6 : 3) * Math.PI)) * 4);
+    blitFrame(plane, fi, ch.x, FLOOR_Y + bob, ch.facing);
+    const draw = PROP[t.prop];
+    if (draw) draw(plane, ch, ph);
+  }
+
+  // ---- power-on boot: a maze wipe-on, then the figure reveals -------------
+  function mazeBit(x, y) {
+    if ((x & 3) && (y & 3)) return 0;                 // only draw on a 4px grid
+    const h = (((x * 7 + 3) * (y * 13 + 5)) >>> 0);
+    return (h % 5 !== 0) ? 1 : 0;                      // most segments on, some gaps
+  }
+  function drawBoot(plane, cube) {
+    const ph = clamp(cube.boot.t / cube.boot.dur, 0, 1);
+    if (ph < 0.12) { plane.fill(1); return; }          // all-segments power-on flash
+    if (ph < 0.48) {                                    // maze builds top → bottom
+      const row = ((ph - 0.12) / 0.36) * LCD;
+      for (let y = 0; y < row && y < LCD; y++)
+        for (let x = 0; x < LCD; x++) if (mazeBit(x, y)) plane[y * LCD + x] = 1;
+      return;
+    }
+    if (ph < 0.82) {                                    // maze clears top → bottom
+      const row = ((ph - 0.48) / 0.34) * LCD;
+      for (let y = Math.floor(row); y < LCD; y++)
+        for (let x = 0; x < LCD; x++) if (mazeBit(x, y)) plane[y * LCD + x] = 1;
+      return;
+    }
+    composeLive(plane, cube);                           // figure settles in
+  }
+
+  // ---- doorway (side door) / hatch (ceiling & floor) art -----------------
+  // `open` = 0 shut .. 1 fully open. Side doors slide a panel into the wall;
+  // hatches part two leaves away from the centre.
+  function drawPortal(plane, edge, open) {
+    open = clamp(open, 0, 1);
+    if (edge === 'left' || edge === 'right') {
+      const H = 22, bot = FLOOR_Y, top = FLOOR_Y - H;   // tall enough to clear a standing figure
+      const right = edge === 'right';
+      const z0 = right ? LCD - 5 : 0, z1 = z0 + 4;   // 5-wide door zone
+      const jamb = right ? z0 : z1;                  // inner post column
+      for (let x = z0; x <= z1; x++) { setOn(plane, x, top); setOn(plane, x, bot); }  // lintel + threshold
+      for (let y = top; y <= top + 3; y++) setOn(plane, jamb, y);                     // short jamb ticks
+      for (let y = bot - 3; y <= bot; y++) setOn(plane, jamb, y);
+      const iLo = right ? z0 + 1 : z0, iHi = right ? z1 : z1 - 1;   // sliding-panel interior cols
+      const covered = Math.round((iHi - iLo + 1) * (1 - open));
+      const seam = top + (H >> 1);
+      for (let k = 0; k < covered; k++) {
+        const x = right ? (iHi - k) : (iLo + k);     // retract toward the outer wall
+        for (let y = top + 1; y < bot; y++) if (y !== seam) setOn(plane, x, y);
+      }
+    } else {
+      const bottomEdge = edge === 'bottom';
+      const row = bottomEdge ? FLOOR_Y : 1;
+      const lip = bottomEdge ? row - 1 : row + 1;
+      const half = 6, jL = CENTER_X - half - 1, jR = CENTER_X + half + 1;
+      setOn(plane, jL, row); setOn(plane, jR, row);  // jamb caps
+      setOn(plane, jL, lip); setOn(plane, jR, lip);
+      const L = Math.round((half + 1) * (1 - open));  // each leaf's reach from its jamb
+      for (let k = 0; k < L; k++) {
+        setOn(plane, jL + 1 + k, row); setOn(plane, jR - 1 - k, row);
+        if (k < L - 1) { setOn(plane, jL + 1 + k, lip); setOn(plane, jR - 1 - k, lip); }
+      }
+    }
+  }
+
+  // draw scene background + occupant figures/props
+  function composeLive(plane, cube) {
+    if (cube.scene) drawScene(plane, cube.scene);
+    // doors / hatches sit behind the figures so a character passes in front
+    for (const edge of ['left', 'right', 'top', 'bottom'])
+      if (cube.door[edge] > 0.02) drawPortal(plane, edge, cube.door[edge]);
+    for (const ch of occupantsOf(cube)) {
+      if (ch.state === 'trick') { drawTrick(plane, ch); continue; }
+      const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
+      const frameIndex = seq[clamp(ch.frame, 0, seq.length - 1)];
+      const baseY = FLOOR_Y + (ch.yOff || 0);
+      blitFrame(plane, frameIndex, ch.x, baseY, ch.facing);
+      if (ch.emote) blitIcon(plane, ch.emote.icon, ch.x, baseY - 24);
+    }
+  }
+
+  // compose a cube's 32x32 LCD plane
+  function composePlane(cube) {
+    const plane = cube.plane;
+    plane.fill(0);
+    if (cube.boot) { drawBoot(plane, cube); return plane; }
+    if (cube.asleep) return plane;        // asleep = blank pale screen (segments off)
+    composeLive(plane, cube);
+    return plane;
+  }
+
+  // ---- jumbo-cube scene backgrounds (original art capturing the video scenes) --
+  function drawScene(plane, kind) {
+    const on = (x, y) => { x = Math.round(x); y = Math.round(y); if (x >= 0 && x < LCD && y >= 0 && y < LCD) plane[y * LCD + x] = 1; };
+    if (kind === 'beach') {
+      // palm trunk, curving up the left with ring texture
+      for (let y = 10; y <= FLOOR_Y; y++) { const tx = 4 + Math.round(Math.sin((FLOOR_Y - y) * 0.22) * 2); on(tx, y); if ((y & 1) === 0) on(tx + 1, y); }
+      const hx = 4 + Math.round(Math.sin((FLOOR_Y - 10) * 0.22) * 2), hy = 9;   // frond hub
+      // five drooping fronds
+      const fronds = [[-1, -0.4], [-0.5, -0.9], [0.2, -1], [0.9, -0.7], [1.3, -0.2]];
+      for (const [dx, dy] of fronds) for (let r = 1; r <= 8; r++)
+        on(hx + dx * r + (dx > 0 ? r * r * 0.03 : -r * r * 0.03), hy + dy * r + r * r * 0.05);
+      // two coconuts under the fronds
+      on(hx + 1, hy + 2); on(hx + 2, hy + 2); on(hx + 4, hy + 3); on(hx + 5, hy + 3);
+      // sky: slow day/night cycle — crescent moon by night, rayed sun by day
+      const night = ((animClock / 15000) % 1) < 0.5;
+      if (night) {
+        for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) {
+          const d = xx * xx + yy * yy, d2 = (xx + 2) * (xx + 2) + yy * yy;
+          if (d <= 10 && d2 > 10) on(26 + xx, 7 + yy);
+        }
+      } else {
+        for (let yy = -2; yy <= 2; yy++) for (let xx = -2; xx <= 2; xx++) if (xx * xx + yy * yy <= 4) on(26 + xx, 7 + yy);
+        for (const [dx, dy] of [[-4, 0], [4, 0], [0, -4], [0, 4], [-3, -3], [3, 3], [3, -3], [-3, 3]]) on(26 + dx, 7 + dy);
+      }
+      // a bird drifting across the sky
+      const brd = 8 + ((animClock / 190 | 0) % 20);
+      on(brd, 5); on(brd + 1, 4); on(brd + 2, 5); on(brd + 5, 6); on(brd + 6, 5); on(brd + 7, 6);
+      // little beach hut on the right
+      for (let x = 22; x <= 28; x++) on(x, FLOOR_Y - 3);                 // roof line
+      on(21, FLOOR_Y - 2); on(29, FLOOR_Y - 2);
+      for (let y = FLOOR_Y - 2; y <= FLOOR_Y; y++) { on(22, y); on(28, y); }
+      // shoreline (rolling dashed surf)
+      for (let x = 0; x < LCD; x++) if ((x + (animClock / 400 | 0)) % 3 !== 0) on(x, FLOOR_Y + 1);
+    } else if (kind === 'city') {
+      // skyline of buildings with lit windows
+      const b = [[0, 15], [6, 8], [11, 19], [16, 6], [22, 12], [27, 17]];
+      const tw = Math.floor(animClock / 650);
+      for (const [bx, top] of b) {
+        for (let y = top; y <= FLOOR_Y; y++) { on(bx, y); on(bx + 4, y); }
+        for (let x = bx; x <= bx + 4; x++) on(x, top);
+        for (let y = top + 2; y < FLOOR_Y - 1; y += 3) {                 // windows twinkle
+          if (((bx * 3 + y * 7 + tw) % 5) !== 0) on(bx + 1, y);
+          if (((bx * 5 + y * 11 + tw) % 5) !== 0) on(bx + 3, y);
+        }
+      }
+      // a ladder between two buildings
+      const lx = 10;
+      for (let y = 12; y <= FLOOR_Y; y++) { on(lx, y); on(lx + 2, y); if ((y & 1) === 0) on(lx + 1, y); }
+      for (let x = 0; x < LCD; x++) on(x, FLOOR_Y + 1);                  // street
+      // a little taxi cruising the street
+      const car = -6 + ((animClock / 130 | 0) % 44);
+      for (let x = 0; x < 7; x++) on(car + x, FLOOR_Y);
+      on(car + 1, FLOOR_Y - 1); on(car + 5, FLOOR_Y - 1);
+    }
+  }
+
+  function drawScreen(cube, sx, sy) {
+    const S = SCREEN_PX;
+    const w = cube.jumbo ? WELL + 5 : WELL;          // jumbo cubes: deeper frame
+    // deep recessed near-black well around the LCD
+    ctx.fillStyle = '#090b06';
+    roundRect(ctx, sx - w, sy - w, S + w * 2, S + w * 2, 9); ctx.fill();
+    if (cube.jumbo) { ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,0,0,0.5)'; roundRect(ctx, sx - 3, sy - 3, S + 6, S + 6, 5); ctx.stroke(); }
+    // inner shadow lip (top + left, for the sunken look)
+    ctx.save();
+    roundRect(ctx, sx - w, sy - w, S + w * 2, S + w * 2, 9); ctx.clip();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(sx - w, sy - w, S + w * 2, 5);
+    ctx.fillRect(sx - w, sy - w, 5, S + w * 2);
+    ctx.restore();
+
+    // pale LCD panel
+    ctx.save();
+    roundRect(ctx, sx, sy, S, S, 2); ctx.clip();
+    ctx.save(); ctx.translate(sx, sy); ctx.fillStyle = matrixTile; ctx.fillRect(0, 0, S, S); ctx.restore();
+
+    // ON pixels
+    const plane = composePlane(cube);
+    ctx.fillStyle = LCD_ON;
+    for (let y = 0; y < LCD; y++)
+      for (let x = 0; x < LCD; x++)
+        if (plane[y * LCD + x]) ctx.fillRect(sx + x * DOT, sy + y * DOT, DOT - 1, DOT - 1);
+
+    // window-blind cover lowering over an emptied cube
+    if (cube.blind > 0.02) {
+      const h = S * cube.blind;
+      ctx.fillStyle = 'rgba(126,138,108,0.9)';
+      ctx.fillRect(sx, sy, S, h);
+      ctx.fillStyle = 'rgba(70,78,58,0.85)';
+      for (let yy = 0; yy < h; yy += DOT * 2) ctx.fillRect(sx, sy + yy, S, 1);
+    }
+
+    // glass sheen
+    ctx.fillStyle = LCD_GLASS;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy); ctx.lineTo(sx + S * 0.5, sy); ctx.lineTo(sx + S * 0.2, sy + S * 0.5); ctx.lineTo(sx, sy + S * 0.35);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // one grey pressable button on the control deck
+  function drawButton(x, y, w, h) {
+    roundRect(ctx, x, y + 2, w, h, 3); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();   // shadow
+    roundRect(ctx, x, y, w, h, 3);
+    const g = ctx.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0, '#e9e6da'); g.addColorStop(1, '#bcb9ac');
+    ctx.fillStyle = g; ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.stroke();
+  }
+
+  function drawCube(cube) {
+    const shake = cube.wiggle > 0 ? Math.sin(cube.wiggle * 0.09) * (cube.wiggle / 500) * 4 : 0;
+    const x = Math.round(cube.x + shake), y = Math.round(cube.y);
+    ctx.save();
+    ctx.translate(x, y);
+
+    // plastic housing
+    const g = ctx.createLinearGradient(0, 0, 0, CUBE_SIZE);
+    if (cube.housing.translucent) { g.addColorStop(0, lighten(cube.housing.base, 0.10)); g.addColorStop(1, cube.housing.dark); ctx.globalAlpha = 0.93; }
+    else { g.addColorStop(0, lighten(cube.housing.base, 0.18)); g.addColorStop(0.6, cube.housing.base); g.addColorStop(1, lighten(cube.housing.base, -0.08)); }
+    roundRect(ctx, 0, 0, CUBE_SIZE, CUBE_SIZE, 20);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 3; ctx.strokeStyle = cube.housing.dark; ctx.stroke();
+
+    // rounded top sheen
+    ctx.save(); roundRect(ctx, 0, 0, CUBE_SIZE, CUBE_SIZE, 20); ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,0.22)';
+    ctx.beginPath(); ctx.moveTo(10, 8); ctx.lineTo(CUBE_SIZE - 10, 8);
+    ctx.quadraticCurveTo(CUBE_SIZE * 0.5, 34, 10, 30); ctx.closePath(); ctx.fill();
+    if (cube.housing.translucent) { ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(4, CUBE_SIZE * 0.4, CUBE_SIZE - 8, CUBE_SIZE * 0.55); }
+    ctx.restore();
+
+    drawScreen(cube, SCREEN_X, SCREEN_Y);
+
+    // ---- control deck: molded game-icon + three buttons ----
+    const deckTop = SCREEN_Y + SCREEN_PX + WELL + 1;
+    // molded game-icon (or ▶ game caption when a trick fires)
+    if (cube.toast) {
+      ctx.font = 'bold 9px "Courier New", monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillText('▶ ' + cube.toast.text.toUpperCase(), CUBE_SIZE / 2, deckTop + 6);
+      ctx.textBaseline = 'alphabetic';
+    } else {
+      drawGameIcon(cube.icon, CUBE_SIZE / 2, deckTop + 6, cube.housing.dark);
+    }
+    // three buttons
+    const bw = 34, bh = 11, gap = 8, total = bw * 3 + gap * 2;
+    const bx0 = (CUBE_SIZE - total) / 2, by = deckTop + 15;
+    for (let i = 0; i < 3; i++) drawButton(bx0 + i * (bw + gap), by, bw, bh);
+    // tiny character name under the buttons
+    ctx.font = '8px "Courier New", monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = cube.housing.translucent ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.7)';
+    ctx.fillText(cube.housing.name.toUpperCase(), CUBE_SIZE / 2, by + bh + 9);
+
+    // collector series badge, top-left corner
+    drawSeriesBadge(cube);
+
+    ctx.restore();
+  }
+
+  // small molded pictograms for the control-deck game icon
+  function drawGameIcon(kind, cx, cy, col) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 1.6; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    const F = () => ctx.fill(), St = () => ctx.stroke();
+    const circle = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); };
+    switch (kind) {
+      case 'heli':
+        ctx.beginPath(); ctx.ellipse(-1, 1, 6, 3.2, 0, 0, 7); F();
+        ctx.beginPath(); ctx.moveTo(5, 1); ctx.lineTo(11, 0); ctx.lineTo(11, 2); ctx.closePath(); F();       // tail
+        ctx.beginPath(); ctx.moveTo(-9, -4); ctx.lineTo(7, -4); St();                                        // rotor
+        ctx.beginPath(); ctx.moveTo(-1, -4); ctx.lineTo(-1, -1); St();
+        ctx.beginPath(); ctx.moveTo(11, -2); ctx.lineTo(11, 2); St(); break;                                 // tail rotor
+      case 'taxi':
+        ctx.beginPath(); ctx.moveTo(-9, 3); ctx.lineTo(-7, -1); ctx.lineTo(-3, -3); ctx.lineTo(4, -3);
+        ctx.lineTo(8, -1); ctx.lineTo(9, 3); ctx.closePath(); F();
+        ctx.fillStyle = '#cfcabb'; circle(-5, 4, 2); F(); circle(5, 4, 2); F(); break;
+      case 'ball': circle(0, 0, 5); St(); ctx.beginPath(); ctx.moveTo(-5, 0); ctx.lineTo(5, 0); ctx.moveTo(0, -5); ctx.lineTo(0, 5); St(); break;
+      case 'note': circle(-3, 3, 2.4); F(); ctx.beginPath(); ctx.moveTo(-1, 3); ctx.lineTo(-1, -5); ctx.lineTo(4, -6); ctx.lineTo(4, 2); St(); circle(3, 2, 2.4); F(); break;
+      case 'star': { ctx.beginPath(); for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? 2.6 : 6; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * r, Math.sin(a) * r); } ctx.closePath(); F(); break; }
+      case 'flame': ctx.beginPath(); ctx.moveTo(0, -6); ctx.quadraticCurveTo(5, -1, 3, 3); ctx.quadraticCurveTo(1, 6, 0, 5); ctx.quadraticCurveTo(-1, 6, -3, 3); ctx.quadraticCurveTo(-5, -1, 0, -6); ctx.closePath(); F(); break;
+      case 'mug': ctx.beginPath(); ctx.rect(-5, -3, 8, 8); F(); ctx.beginPath(); ctx.arc(4, 1, 3, -1.4, 1.4); St(); ctx.beginPath(); ctx.moveTo(-3, -6); ctx.lineTo(-3, -4); ctx.moveTo(0, -6); ctx.lineTo(0, -4); St(); break;
+      case 'wrench': ctx.save(); ctx.rotate(-0.6); ctx.beginPath(); ctx.rect(-1.5, -6, 3, 12); F(); circle(0, -6, 3.2); St(); circle(0, 6, 3.2); St(); ctx.restore(); break;
+      case 'hammer': ctx.beginPath(); ctx.rect(-1.5, -2, 3, 9); F(); ctx.beginPath(); ctx.rect(-6, -6, 12, 4); F(); break;
+      case 'dumbbell': ctx.beginPath(); ctx.rect(-6, -1.5, 12, 3); F(); ctx.beginPath(); ctx.rect(-8, -4, 3, 8); F(); ctx.beginPath(); ctx.rect(5, -4, 3, 8); F(); break;
+      case 'badge': { ctx.beginPath(); for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? 4 : 6; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * r, Math.sin(a) * r); } ctx.closePath(); F(); ctx.fillStyle = '#cfcabb'; circle(0, 0, 1.6); F(); break; }
+      case 'paper': ctx.beginPath(); ctx.rect(-4, -6, 8, 12); F(); ctx.strokeStyle = '#cfcabb'; ctx.beginPath(); for (let yy = -3; yy <= 3; yy += 2) { ctx.moveTo(-2.5, yy); ctx.lineTo(2.5, yy); } St(); break;
+      case 'parcel': ctx.beginPath(); ctx.rect(-5, -5, 10, 10); F(); ctx.strokeStyle = '#cfcabb'; ctx.beginPath(); ctx.moveTo(0, -5); ctx.lineTo(0, 5); ctx.moveTo(-5, 0); ctx.lineTo(5, 0); St(); break;
+      case 'bat': ctx.save(); ctx.rotate(-0.6); ctx.beginPath(); ctx.moveTo(-1.5, 6); ctx.lineTo(-3, -5); ctx.quadraticCurveTo(0, -8, 3, -5); ctx.lineTo(1.5, 6); ctx.closePath(); F(); ctx.restore(); break;
+      case 'hoop': circle(0, 1, 5); St(); ctx.beginPath(); ctx.moveTo(-5, 1); ctx.lineTo(-3, 6); ctx.moveTo(5, 1); ctx.lineTo(3, 6); ctx.moveTo(0, 1); ctx.lineTo(0, 6); St(); break;
+      case 'board': ctx.beginPath(); ctx.ellipse(0, -1, 8, 2.2, 0, 0, 7); F(); ctx.fillStyle = '#cfcabb'; circle(-5, 3, 1.6); F(); circle(5, 3, 1.6); F(); break;
+      case 'drop': ctx.beginPath(); ctx.moveTo(0, -6); ctx.quadraticCurveTo(5, 1, 0, 5); ctx.quadraticCurveTo(-5, 1, 0, -6); ctx.closePath(); F(); break;
+      case 'rocket': ctx.beginPath(); ctx.moveTo(0, -7); ctx.quadraticCurveTo(4, -2, 3, 4); ctx.lineTo(-3, 4); ctx.quadraticCurveTo(-4, -2, 0, -7); ctx.closePath(); F(); ctx.beginPath(); ctx.moveTo(-3, 3); ctx.lineTo(-6, 6); ctx.lineTo(-2, 5); ctx.moveTo(3, 3); ctx.lineTo(6, 6); ctx.lineTo(2, 5); F(); break;
+      case 'paw': circle(0, 3, 3.2); F(); circle(-4, -1, 1.6); F(); circle(-1.4, -4, 1.6); F(); circle(1.4, -4, 1.6); F(); circle(4, -1, 1.6); F(); break;
+      case 'flag': ctx.beginPath(); ctx.moveTo(-4, 7); ctx.lineTo(-4, -7); St(); ctx.beginPath(); ctx.moveTo(-4, -7); ctx.lineTo(5, -4); ctx.lineTo(-4, -1); ctx.closePath(); F(); break;
+      case 'loop': circle(0, 0, 5); St(); circle(0, 0, 2.2); St(); break;
+      default: circle(0, 0, 4); St();
+    }
+    ctx.restore();
+  }
+
+  function seriesTag(def) {
+    if (def.se) return 'S.E.';
+    if (def.region === 'JP') return 'JP';
+    const s = def.series;
+    if (s.startsWith('Series 1')) return 'S1';
+    if (s.startsWith('Series 2')) return 'S2';
+    if (s.startsWith('Series 3')) return 'S3';
+    if (s.startsWith('Series 4')) return 'S4';
+    if (s.startsWith('MODs')) return 'MOD';
+    if (s.startsWith('Jumbo')) return 'JMB';
+    return '?';
+  }
+  function drawSeriesBadge(cube) {
+    const tag = seriesTag(cube.housing);
+    ctx.font = 'bold 9px "Courier New", monospace';
+    const w = ctx.measureText(tag).width + 9, bx = 7, by = 6, h = 13;
+    roundRect(ctx, bx, by, w, h, 3);
+    ctx.fillStyle = cube.housing.se ? '#ffe14d' : 'rgba(0,0,0,0.38)';
+    ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.stroke();
+    ctx.fillStyle = cube.housing.se ? '#7a4a00' : 'rgba(255,255,255,0.95)';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(tag, bx + 4, by + h / 2 + 0.5);
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  function lighten(hex, amt) {
+    const n = parseInt(hex.slice(1), 16);
+    let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    r = clamp(Math.round(r + 255 * amt), 0, 255);
+    g = clamp(Math.round(g + 255 * amt), 0, 255);
+    b = clamp(Math.round(b + 255 * amt), 0, 255);
+    return `rgb(${r},${g},${b})`;
+  }
+
+  function drawConnectionGlow() {
+    const span = 44;
+    for (const cube of cubes) {
+      ctx.fillStyle = 'rgba(255,242,168,0.8)';
+      if (cube.conn.right) ctx.fillRect(cube.x + CUBE_SIZE - 4, cube.y + CUBE_SIZE / 2 - span / 2, 8, span);
+      if (cube.conn.bottom) ctx.fillRect(cube.x + CUBE_SIZE / 2 - span / 2, cube.y + CUBE_SIZE - 4, span, 8);
+    }
+  }
+
+  function render() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, CSS_W, CSS_H);
+    drawConnectionGlow();
+    for (const cube of cubes) drawCube(cube);
+  }
+
+  // ================================================================= INPUT
+  function toLocal(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (CSS_W / r.width), y: (e.clientY - r.top) * (CSS_H / r.height) };
+  }
+  function cubeAt(x, y) {
+    for (let i = cubes.length - 1; i >= 0; i--) {
+      const c = cubes[i];
+      if (x >= c.x && x <= c.x + CUBE_SIZE && y >= c.y && y <= c.y + CUBE_SIZE) return c;
+    }
+    return null;
+  }
+  function findSnap(cube, tx, ty) {
+    let best = null;
+    for (const o of cubes) {
+      if (o === cube) continue;
+      const targets = [
+        { x: o.x + CUBE_SIZE, y: o.y }, { x: o.x - CUBE_SIZE, y: o.y },
+        { x: o.x, y: o.y + CUBE_SIZE }, { x: o.x, y: o.y - CUBE_SIZE },
+      ];
+      for (const t of targets) {
+        const d = Math.hypot(tx - t.x, ty - t.y);
+        if (d < SNAP && (!best || d < best.d)) best = { x: t.x, y: t.y, d };
+      }
+    }
+    return best;
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    ensureAudio();
+    const p = toLocal(e);
+    const cube = cubeAt(p.x, p.y);
+    if (!cube) return;
+    canvas.setPointerCapture(e.pointerId);
+    cubes.splice(cubes.indexOf(cube), 1); cubes.push(cube);
+    drag = { cube, ox: p.x - cube.x, oy: p.y - cube.y, moved: false, sx: p.x, sy: p.y,
+      conn: connectionCount(), lastX: p.x, lastY: p.y, lastT: performance.now(), shake: 0 };
+    canvas.classList.add('dragging');
+    wakeCube(cube);
+  });
+
+  canvas.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const p = toLocal(e);
+    if (!drag.moved && Math.hypot(p.x - drag.sx, p.y - drag.sy) > 5) drag.moved = true;
+    if (!drag.moved) return;
+
+    // shake detection while dragging → dizzy occupants
+    const now = performance.now(), dtm = Math.max(1, now - drag.lastT);
+    const vx = (p.x - drag.lastX) / dtm, vy = (p.y - drag.lastY) / dtm;
+    const sp = Math.hypot(vx, vy);
+    drag.shake = drag.shake * 0.85 + sp * 0.15;
+    if (drag.shake > 2.2) {
+      for (const ch of drag.cube.occupants.map(cubeById2)) if (ch && ch.dizzy <= 0) { ch.act = null; ch.yOff = 0; ch.dizzy = 1500; ch.state = 'dizzy'; setAnim(ch, 'dizzy'); }
+      drag.cube.wiggle = 260;
+      if (Math.random() < 0.06) sfx.dizzy();
+    }
+    drag.lastX = p.x; drag.lastY = p.y; drag.lastT = now;
+
+    let tx = clamp(p.x - drag.ox, 0, Math.max(0, CSS_W - CUBE_SIZE));
+    let ty = clamp(p.y - drag.oy, 0, Math.max(0, CSS_H - CUBE_SIZE));
+    const snap = findSnap(drag.cube, tx, ty);
+    if (snap) { tx = clamp(snap.x, 0, Math.max(0, CSS_W - CUBE_SIZE)); ty = clamp(snap.y, 0, Math.max(0, CSS_H - CUBE_SIZE)); }
+    drag.cube.x = tx; drag.cube.y = ty;
+
+    recomputeConnections();
+    const nc = connectionCount();
+    if (nc > drag.conn) { sfx.connect(); for (const c of cubes) wakeCube(c); }
+    drag.conn = nc;
+    dissolveOrphans();
+  });
+
+  function cubeById2(id) { return chars.find(c => c.id === id); }
+
+  function endDrag() {
+    if (!drag) return;
+    canvas.classList.remove('dragging');
+    if (!drag.moved) pokeCube(drag.cube);
+    else { recomputeConnections(); dissolveOrphans(); }
+    drag = null;
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  // -------------------------------------------------------------------- UI
+  addBtn.addEventListener('click', () => { ensureAudio(); if (addCube()) sfx.add(); });
+  shakeBtn.addEventListener('click', shakeAll);
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.textContent = muted ? 'Muted' : 'Sound';
+    muteBtn.classList.toggle('is-on', !muted);
+    if (!muted) { ensureAudio(); beep(700, 0.05); }
+  });
+  resetBtn.addEventListener('click', () => {
+    if (!window.confirm('Clear the sandbox and start over?')) return;
+    cubes = []; chars = []; cubeSeq = charSeq = 1; rosterBag = [];
+    initWorld(); updateAddBtn();
+  });
+
+  // ------------------------------------------------------------------ boot
+  function resize() {
+    const r = stage.getBoundingClientRect();
+    CSS_W = Math.max(320, Math.round(r.width));
+    // Fill the viewport; grow taller so the grid can spill into a scroll region.
+    let needed = Math.round(r.height);
+    for (const c of cubes) needed = Math.max(needed, c.y + CUBE_SIZE + GAP);
+    CSS_H = Math.max(Math.round(r.height), needed);
+    dpr = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.round(CSS_W * dpr);
+    canvas.height = Math.round(CSS_H * dpr);
+    canvas.style.width = CSS_W + 'px';
+    canvas.style.height = CSS_H + 'px';
+    ctx.imageSmoothingEnabled = false;
+    buildMatrixTile();
+    for (const c of cubes) {
+      c.x = clamp(c.x, 0, Math.max(0, CSS_W - CUBE_SIZE));
+      c.y = clamp(c.y, 0, Math.max(0, CSS_H - CUBE_SIZE));
+    }
+    recomputeConnections();
+  }
+  window.addEventListener('resize', resize);
+
+  function tick(t) {
+    if (last == null) last = t;
+    const dt = Math.min(t - last, 60); last = t;
+    animClock += dt;
+    updateChars(dt);
+    updateCubes(dt);
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  resize();
+  initWorld();
+  updateAddBtn();
+  requestAnimationFrame(tick);
+
+  // debug hook
+  window.__cw = { cubes, chars, CSS_W: () => CSS_W, CSS_H: () => CSS_H,
+    ff: n => { for (let i = 0; i < n; i++) { updateChars(FRAME_MS); updateCubes(FRAME_MS); } },
+    recompute: recomputeConnections,
+    forceTransfer: (charIdx, edge) => { const ch = chars[charIdx]; beginTransfer(ch, cubeById(ch.cubeId), edge); },
+    startAct: (charIdx, key) => startAct(chars[charIdx], key),
+    planeAscii: (cubeIdx) => {
+      const plane = composePlane(cubes[cubeIdx]);
+      let out = '';
+      for (let y = 0; y < LCD; y++) { for (let x = 0; x < LCD; x++) out += plane[y * LCD + x] ? '#' : '.'; out += '\n'; }
+      return out;
+    },
+    portalAscii: (edge, open) => {
+      const plane = new Uint8Array(LCD * LCD);
+      drawPortal(plane, edge, open);
+      let out = '';
+      for (let y = 0; y < LCD; y++) { for (let x = 0; x < LCD; x++) out += plane[y * LCD + x] ? '#' : '.'; out += '\n'; }
+      return out;
+    },
+    trickAscii: (key, ph) => {
+      const plane = new Uint8Array(LCD * LCD);
+      const ch = { x: 16, facing: 1, trick: key, trickT: ph * 2800, trickDur: 2800 };
+      drawTrick(plane, ch);
+      let out = '';
+      for (let y = 0; y < LCD; y++) { for (let x = 0; x < LCD; x++) out += plane[y * LCD + x] ? '#' : '.'; out += '\n'; }
+      return out;
+    } };
+})();

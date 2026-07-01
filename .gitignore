@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Local editor / tooling config
+.claude/
+
+# Large reference videos (exceed GitHub's file-size limit)
+*.mp4
+
+# Empty working folders
+clash/
+untitled folder/

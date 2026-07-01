@@ -1,0 +1,59 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+
+body {
+  font-family: 'SF Mono', ui-monospace, 'Menlo', 'Consolas', monospace;
+  background: #14150f;
+  color: #c9cbb8;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- sandbox: the whole screen ---------- */
+#stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: #14150f;
+}
+#game {
+  display: block;
+  width: 100%;
+  touch-action: none;
+  cursor: grab;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+#game.dragging { cursor: grabbing; }
+
+/* ---------- thin control bar ---------- */
+#bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: #1c1e15;
+  border-top: 1px solid #2c2f22;
+}
+.spacer { flex: 1 1 auto; }
+
+.btn {
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid #3a3d2d;
+  background: #23261b;
+  color: #c9cbb8;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.btn:hover { background: #2c3022; border-color: #4a4e3a; }
+.btn:active { background: #191b12; }
+.btn.is-on { color: #9aa886; border-color: #4a4e3a; }
