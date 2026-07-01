@@ -15,10 +15,17 @@
   const GAP = 22;
   const SNAP = 30;              // px proximity for a magnetic snap
   const TOL = 2;                // px flush tolerance for a live connection
-  const FRAME_MS = 170;         // per LCD animation frame (choppy toy cadence)
-  const WALK_SPEED = 0.011;     // dot columns per ms
-  const VWALK = 0.017;          // dot rows per ms (rising/dropping through a hatch)
-  // SLEEP_IDLE comes from data.js
+  // LCD_TICK comes from data.js — every screen-visible change happens in whole
+  // ticks (see tickCube). Speeds below are expressed in dots/steps *per tick*.
+  const WALK_DOTS = 2;          // horizontal walk speed, dots/tick
+  const VWALK_DOTS = 3;         // vertical hatch travel speed, dots/tick
+  const DOOR_STEPS = 4;         // door[edge] is an integer 0..DOOR_STEPS
+  const BLIND_STEP = 4;         // venetian blind rows revealed/hidden per tick
+  const BOOT_TICKS = 13;        // ~2100ms / 160ms
+  const BOOT_FLASH_TICKS = 3;   // wake-from-sleep power-flash duration
+  const TRICK_TICKS = 17;       // ~2800ms / 160ms
+  const GHOST_HALF_LIFE = 90;   // ms — STN pixel-off fade half-life
+  const WAVE_LOOPS_GREET = 2;   // full wave loops played during a 'greet' phase
 
   // Small monochrome LCD emote icons (drawn in ON dots above a character).
   const EMOTES = {
@@ -57,7 +64,7 @@
   let chars = [], charSeq = 1;
 
   let muted = false, audioCtx = null, drag = null, matrixTile = null;
-  let last = null, animClock = 0;
+  let last = null;
 
   // ------------------------------------------------------------- utilities
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -130,14 +137,16 @@
       facing: Math.random() < 0.5 ? -1 : 1,
       restAnim: Math.random() < 0.5 ? 'idle' : 'idle2',
       state: 'idle',
-      anim: 'idle', frame: 0, frameT: 0, oneShot: null,
+      anim: 'idle', frame: 0, oneShot: null,
       act: null,                     // active shared behaviour (sit/wave/…)
-      think: rand(600, 2000),
+      think: irand(4, 13),           // ticks until next idle decision
       emote: null,
-      dizzy: 0,
-      trickT: 0, trickDur: 0,
+      dizzy: 0,                      // ticks remaining
+      trickT: 0, trickDur: 0,        // ticks
       transEdge: null, transAxis: 'h', transPhase: null, enterEdge: null,
       yOff: 0,                       // vertical offset while using a hatch
+      greetWaves: 0,                 // wave-loop counter during transfer 'greet'
+      clamber: false,                // B4: alternates each tick while climbing a hatch
     };
     chars.push(ch);
     cube.occupants.push(ch.id);
@@ -155,15 +164,21 @@
       x, y,
       conn: { top: null, bottom: null, left: null, right: null },
       occupants: [],
-      blind: 0,            // 0 open .. 1 fully closed (Venetian blind)
-      door: { left: 0, right: 0, top: 0, bottom: 0 },  // 0 shut .. 1 open (per edge)
+      blind: 0,            // 0 .. LCD rows covered (Venetian blind, integer)
+      door: { left: 0, right: 0, top: 0, bottom: 0 },  // 0..DOOR_STEPS per edge
       wiggle: 0,
-      idle: 0,             // ms since last interaction (for sleep)
+      idle: 0,             // ms since last interaction (for sleep) — physical-world timer
       asleep: false,
-      boot: { t: 0, dur: 2100 },   // power-on maze wipe-on animation
-      toast: null,         // transient "game name" caption under the screen
+      boot: { t: 0, dur: BOOT_TICKS },   // power-on maze wipe-on animation (ticks)
+      toast: null,          // transient "game name" caption chip (ms countdown, smooth UI)
+      connFlash: 0,         // ms remaining for the magnetic-latch pulse (physical-world)
+      _hover: false,         // B6: pointer currently over this cube
+      _pressBtn: -1, _pressT: 0,   // B5: which deck button is pressed, ms remaining
       plane: new Uint8Array(LCD * LCD),
+      lum: new Float32Array(LCD * LCD),   // STN ghosting luminance per dot
       _occSig: '',
+      tickT: rand(0, LCD_TICK),   // phase-offset so cubes don't tick in lockstep
+      ticks: 0,
     };
     cubes.push(cube);
     makeChar(cube, def);
@@ -175,7 +190,10 @@
   }
 
   // ---- connection detection (magnetic sides, flush edges) ----
+  // B7: flags cube.connFlash on any seam that just newly connected, so the
+  // latch chrome can pulse briefly.
   function recomputeConnections() {
+    const prev = new Map(cubes.map(c => [c.id, { r: c.conn.right, b: c.conn.bottom }]));
     for (const c of cubes) c.conn = { top: null, bottom: null, left: null, right: null };
     for (let i = 0; i < cubes.length; i++) {
       for (let j = i + 1; j < cubes.length; j++) {
@@ -191,6 +209,11 @@
           else if (Math.abs((B.y + CUBE_SIZE) - A.y) < TOL) { B.conn.bottom = A.id; A.conn.top = B.id; }
         }
       }
+    }
+    for (const c of cubes) {
+      const was = prev.get(c.id);
+      if (!was) continue;
+      if ((c.conn.right && c.conn.right !== was.r) || (c.conn.bottom && c.conn.bottom !== was.b)) c.connFlash = 600;
     }
   }
   const cubeConnected = c => c.conn.top || c.conn.bottom || c.conn.left || c.conn.right;
@@ -252,17 +275,21 @@
   function addCube() {
     const spot = findSpot();
     if (!spot) return null;
-    const cube = makeCube(spot.x, spot.y);
+    // C3: scatter like real toys on a table, not a spreadsheet grid — jitter
+    // is applied after the collision-free grid spot is found (GAP=22 is well
+    // clear of the +-10px jitter, so cubes never actually overlap).
+    const jx = clamp(spot.x + rand(-10, 10), 0, Math.max(0, CSS_W - CUBE_SIZE));
+    const jy = Math.max(0, spot.y + rand(-10, 10));
+    const cube = makeCube(jx, jy);
     recomputeConnections();
     resize();          // grow the sandbox if the grid pushed past the viewport
     return cube;
   }
-  function updateAddBtn() { /* unlimited cubes — button never disables */ }
   function initWorld() { for (let i = 0; i < 4; i++) addCube(); }
 
   // =========================================================== CHARACTER AI
   function setAnim(ch, name, oneShot) {
-    if (ch.anim !== name || oneShot) { ch.anim = name; ch.frame = 0; ch.frameT = 0; }
+    if (ch.anim !== name || oneShot) { ch.anim = name; ch.frame = 0; }
     ch.oneShot = oneShot || null;
   }
 
@@ -292,7 +319,7 @@
   // crossing through each other mid-transfer) --------------------------------
   function edgeActive(cube, edge) {
     return occupantsOf(cube).some(ch =>
-      (ch.state === 'transfer' && ch.transEdge === edge) ||
+      (ch.state === 'transfer' && ch.transEdge === edge && (ch.transPhase === 'greet' || ch.transPhase === 'cross')) ||
       (ch.state === 'entering' && ch.enterEdge === edge));
   }
   function pairBusy(cube, edge) {
@@ -302,12 +329,14 @@
   }
 
   // start walking a character out through `edge` into the neighbour.
-  // Phase 'approach' = walk to the door sill; 'cross' = pass through once open.
+  // Phase 'approach' = walk to the door sill; 'greet' = face the doorway and
+  // wave while it swings open (toy spec: cubes wave before crossing); 'cross'
+  // = pass through once open.
   function beginTransfer(ch, cube, edge) {
     ch.state = 'transfer';
     ch.transEdge = edge;
     ch.transPhase = 'approach';
-    ch.act = null; ch.oneShot = null; ch.yOff = 0;
+    ch.act = null; ch.oneShot = null; ch.yOff = 0; ch.greetWaves = 0;
     setAnim(ch, 'walk');
     if (edge === 'left' || edge === 'right') {
       ch.transAxis = 'h';
@@ -353,54 +382,73 @@
     sfx.transfer();
   }
 
-  function wakeCube(cube) { cube.idle = 0; cube.asleep = false; }
+  // wake a cube; if it was asleep, play the short B3 power-flash (reuses the
+  // boot mechanism with a flash-only, no-maze variant) instead of the full
+  // spawn maze-wipe boot.
+  function wakeCube(cube) {
+    if (cube.asleep) { cube.boot = { t: 0, dur: BOOT_FLASH_TICKS, flash: true }; }
+    cube.idle = 0; cube.asleep = false;
+  }
 
-  function updateChar(ch, dt) {
-    const cube = cubeById(ch.cubeId);
-    if (!cube) return;
+  // step `cur` toward `target` by whole dots, one LCD tick at a time — snaps
+  // on overshoot so movement always lands cleanly on an integer dot.
+  const towardTick = (cur, target, dots) => toward(cur, target, dots, 1);
 
-    // advance animation frames
-    ch.frameT += dt;
-    if (ch.frameT >= FRAME_MS) {
-      ch.frameT -= FRAME_MS;
-      const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
-      ch.frame++;
-      if (ch.frame >= seq.length) {
-        ch.frame = 0;
-        if (ch.state === 'acting' && ch.act) onActLoop(ch);        // looped behaviour
-        else if (ch.oneShot) { ch.oneShot = null; if (ch.state === 'acting') { ch.state = 'idle'; setAnim(ch, 'idle'); } }
-      }
+  // advance one character by exactly one LCD tick. Everything screen-visible
+  // (frame, position, state transitions) changes only here — never between
+  // ticks — so a cube's plane is bit-identical between tickCube() calls.
+  function tickChar(ch, cube) {
+    // advance animation frame one step per tick
+    const seq0 = CW_ANIM[ch.anim] || CW_ANIM.idle;
+    ch.frame++;
+    if (ch.frame >= seq0.length) {
+      ch.frame = 0;
+      if (ch.state === 'acting' && ch.act) onActLoop(ch);        // looped behaviour
+      else if (ch.oneShot) { ch.oneShot = null; if (ch.state === 'acting') { ch.state = 'idle'; setAnim(ch, 'idle'); } }
     }
 
     if (cube.asleep) { setAnim(ch, 'idle'); return; }
 
     // dizzy overrides
     if (ch.dizzy > 0) {
-      ch.dizzy -= dt;
+      ch.dizzy--;
       ch.state = 'dizzy'; setAnim(ch, 'dizzy');
       if (ch.dizzy <= 0) { ch.state = 'idle'; setAnim(ch, 'idle'); }
       return;
     }
 
     if (ch.state === 'transfer') {
-      const door = cube.door[ch.transEdge];
+      const door = cube.door[ch.transEdge];             // integer 0..DOOR_STEPS
       if (ch.transAxis === 'h') {
-        if (ch.transPhase === 'approach') {                 // walk to the door sill
+        if (ch.transPhase === 'approach') {              // walk to the door sill
           ch.facing = ch.threshX < ch.x ? -1 : 1;
-          ch.x = toward(ch.x, ch.threshX, WALK_SPEED, dt);
-          if (ch.x === ch.threshX) ch.transPhase = 'cross';
-        } else if (door > 0.55) {                            // step through once it's open
-          ch.x += ch.facing * WALK_SPEED * dt;
+          ch.x = towardTick(ch.x, ch.threshX, WALK_DOTS);
+          if (ch.x === ch.threshX) { ch.transPhase = 'greet'; ch.greetWaves = 0; ch.facing = ch.transEdge === 'right' ? 1 : -1; setAnim(ch, 'wave', true); }
+        } else if (ch.transPhase === 'greet') {          // face the doorway, wave while it opens
+          if (ch.frame === 0 && ch.oneShot == null) {     // clip just wrapped (setAnim above cleared oneShot on wrap)
+            ch.greetWaves++;
+            if (ch.greetWaves >= WAVE_LOOPS_GREET) ch.transPhase = 'cross';
+            else setAnim(ch, 'wave', true);
+          }
+        } else if (door >= DOOR_STEPS) {                 // step through once fully open
+          ch.x += ch.facing * WALK_DOTS;
           if ((ch.facing < 0 && ch.x <= ch.exitX) || (ch.facing > 0 && ch.x >= ch.exitX))
             completeTransfer(ch, cube, ch.transEdge);
         }
-      } else {                                              // vertical: centre under the hatch, then rise/drop
+      } else {                                          // vertical: centre under the hatch, then rise/drop
         if (ch.transPhase === 'approach') {
           ch.facing = CENTER_X < ch.x ? -1 : 1;
-          ch.x = toward(ch.x, CENTER_X, WALK_SPEED, dt);
-          if (ch.x === CENTER_X) ch.transPhase = 'cross';
-        } else if (door > 0.55) {
-          ch.yOff += ch.vdir * VWALK * dt;
+          ch.x = towardTick(ch.x, CENTER_X, WALK_DOTS);
+          if (ch.x === CENTER_X) { ch.transPhase = 'greet'; ch.greetWaves = 0; setAnim(ch, 'wave', true); }
+        } else if (ch.transPhase === 'greet') {
+          if (ch.frame === 0 && ch.oneShot == null) {
+            ch.greetWaves++;
+            if (ch.greetWaves >= WAVE_LOOPS_GREET) ch.transPhase = 'cross';
+            else setAnim(ch, 'wave', true);
+          }
+        } else if (door >= DOOR_STEPS) {
+          ch.clamber = !ch.clamber;                    // B4: clambering, not levitating
+          ch.yOff += ch.vdir * VWALK_DOTS;
           if ((ch.vdir < 0 && ch.yOff <= ch.exitYOff) || (ch.vdir > 0 && ch.yOff >= ch.exitYOff))
             completeTransfer(ch, cube, ch.transEdge);
         }
@@ -409,26 +457,32 @@
     }
     if (ch.state === 'entering') {
       if (ch.transAxis === 'v' && ch.yOff !== 0) {           // settle onto the floor first
-        ch.yOff = toward(ch.yOff, 0, VWALK, dt);
+        // B4: clambering — alternate arms-up pose (frame 21) with the walk frame,
+        // one flip per tick, so it reads as climbing rather than levitating.
+        ch.clamber = !ch.clamber;
+        ch.yOff = towardTick(ch.yOff, 0, VWALK_DOTS);
         return;
       }
       ch.yOff = 0;
       ch.facing = ch.target < ch.x ? -1 : 1;
-      ch.x = toward(ch.x, ch.target, WALK_SPEED, dt);
-      if (ch.x === ch.target) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = rand(700, 2200); }
+      ch.x = towardTick(ch.x, ch.target, WALK_DOTS);
+      if (ch.x === ch.target) {
+        ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = irand(4, 14);
+        greetArrival(ch, cube);
+      }
       return;
     }
     if (ch.state === 'walking') {
       ch.facing = ch.target < ch.x ? -1 : 1;
-      ch.x = toward(ch.x, ch.target, WALK_SPEED, dt);
-      if (ch.x === ch.target) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = rand(700, 2200); }
+      ch.x = towardTick(ch.x, ch.target, WALK_DOTS);
+      if (ch.x === ch.target) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = irand(4, 14); }
       return;
     }
     if (ch.state === 'acting') {                    // a looped behaviour (sit/wave/…)
       const a = ch.act;
       if (a && a.phase === 'hold') {                // sustain the pose (e.g. stay seated)
-        a.holdT += dt;
-        if (a.holdT >= a.holdDur) {
+        a.holdT--;
+        if (a.holdT <= 0) {
           const b = BEHAVIORS[a.key];
           if (b.stand) { a.phase = 'stand'; setAnim(ch, b.stand, true); }
           else finishAct(ch);
@@ -436,9 +490,9 @@
       }
       return;
     }
-    if (ch.state === 'interacting') { ch.think -= dt; if (ch.think <= 0) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.emote = null; } return; }
+    if (ch.state === 'interacting') { ch.think--; if (ch.think <= 0) { ch.state = 'idle'; setAnim(ch, 'idle'); ch.emote = null; } return; }
     if (ch.state === 'trick') {                     // performing signature move
-      ch.trickT += dt;
+      ch.trickT++;
       if (ch.trickT >= ch.trickDur) { ch.state = 'idle'; setAnim(ch, 'idle'); }
       return;
     }
@@ -449,15 +503,15 @@
     const lx = laneX(ch);
     if (lx != null && Math.abs(ch.x - lx) > 0.6) {
       ch.facing = ch.x < lx ? 1 : -1;
-      ch.x = toward(ch.x, lx, WALK_SPEED, dt);
+      ch.x = towardTick(ch.x, lx, WALK_DOTS);
       setAnim(ch, 'walk');
       return;
     }
     if (ch.anim === 'walk') setAnim(ch, ch.restAnim);
 
-    ch.think -= dt;
+    ch.think--;
     if (ch.think > 0) return;
-    ch.think = rand(320, 1150);                    // real figures act almost constantly
+    ch.think = irand(2, 8);                          // real figures act almost constantly
 
     const edges = connectedEdges(cube);
     const solo = lx == null;
@@ -482,6 +536,24 @@
     startAct(ch, pick(IDLE_ACTS));                 // shared looping behaviour
   }
 
+  // B2: when a character finishes 'entering' a cube that already has other
+  // present occupants, the nearest resident (if free) turns to greet them —
+  // both wave once with a heart/note emote on the visitor.
+  function greetArrival(ch, cube) {
+    const others = occupantsOf(cube).filter(o => o.id !== ch.id && (o.state === 'idle' || (o.state === 'acting' && !o.act)));
+    if (!others.length) return;
+    let nearest = others[0], best = Math.abs(others[0].x - ch.x);
+    for (const o of others) { const d = Math.abs(o.x - ch.x); if (d < best) { best = d; nearest = o; } }
+    nearest.act = null; nearest.oneShot = null;
+    nearest.facing = ch.x >= nearest.x ? 1 : -1;
+    ch.facing = nearest.x >= ch.x ? 1 : -1;
+    nearest.state = ch.state = 'interacting';
+    setAnim(nearest, 'wave', true); setAnim(ch, 'wave', true);
+    nearest.think = ch.think = 8;                  // ~1.3s at LCD_TICK
+    ch.emote = { icon: pick(['heart', 'note']), t: 8 };
+    sfx.greet();
+  }
+
   // ---- shared looping-behaviour runner -----------------------------------
   function startAct(ch, key) {
     const b = BEHAVIORS[key];
@@ -489,13 +561,13 @@
     ch.oneShot = null;
     ch.act = { key, phase: 'play', loops: b.loops ? irand(b.loops[0], b.loops[1] + 1) : 1, holdT: 0, holdDur: 0 };
     setAnim(ch, b.anim, true);
-    ch.emote = b.emote ? { icon: b.emote, t: 900 } : null;
+    ch.emote = b.emote ? { icon: b.emote, t: 6 } : null;     // ticks
   }
   function onActLoop(ch) {                          // called whenever the clip wraps
     const a = ch.act, b = BEHAVIORS[a.key];
     if (a.phase === 'play') {
       if (--a.loops > 0) return;                    // keep repeating the clip
-      if (b.hold) { a.phase = 'hold'; a.holdT = 0; a.holdDur = rand(b.holdDur[0], b.holdDur[1]); setAnim(ch, b.hold); }
+      if (b.hold) { a.phase = 'hold'; a.holdT = 0; a.holdDur = irand(Math.round(b.holdDur[0] / LCD_TICK), Math.round(b.holdDur[1] / LCD_TICK) + 1); setAnim(ch, b.hold); }
       else finishAct(ch);
     } else if (a.phase === 'stand') {               // outro finished
       finishAct(ch);
@@ -504,7 +576,7 @@
   function finishAct(ch) {
     ch.act = null; ch.oneShot = null;
     ch.state = 'idle'; setAnim(ch, 'idle');
-    ch.think = rand(500, 1600);
+    ch.think = irand(3, 10);                        // ticks
   }
 
   const BODY_TO_ANIM = { jump: 'idle', dance: 'wave', kick: 'walk' };
@@ -513,67 +585,95 @@
     const t = TRICKS[ch.trick];
     if (!t) return;
     ch.act = null;
-    ch.state = 'trick'; ch.trickT = 0; ch.trickDur = 2800;
+    ch.state = 'trick'; ch.trickT = 0; ch.trickDur = TRICK_TICKS;
     setAnim(ch, bodyToAnim(t.body), true);
     ch.emote = null;
-    cube.toast = { text: t.game, t: 3200 };
+    cube.toast = { text: t.game, t: 3200, dur: 3200 };   // toast is UI chrome, ms (see C2)
     wakeCube(cube);
     sfx.greet();
   }
 
-  // co-occupants in adjacent lanes turn to greet each other (they're already
-  // spaced apart, so no overlap — they wave across the gap)
-  function detectInteractions() {
-    const groups = new Map();
-    for (const ch of chars) {
-      if (ch.state !== 'idle' || cubeById(ch.cubeId).asleep) continue;
-      if (!groups.has(ch.cubeId)) groups.set(ch.cubeId, []);
-      groups.get(ch.cubeId).push(ch);
-    }
-    for (const [, list] of groups) {
-      if (list.length < 2) continue;
-      for (let i = 0; i < list.length; i++)
-        for (let j = i + 1; j < list.length; j++) {
-          const a = list[i], b = list[j];
-          if (Math.random() < 0.03) {
-            a.facing = b.x >= a.x ? 1 : -1; b.facing = a.x >= b.x ? 1 : -1;
-            a.state = b.state = 'interacting';
-            setAnim(a, 'wave', true); setAnim(b, 'wave', true);
-            a.think = b.think = 1200;
-            const icon = pick(['heart', 'note', 'exclaim']);
-            a.emote = { icon, t: 1200 };
-            sfx.greet();
-          }
+  // co-occupants sharing a cube occasionally turn to greet each other (they're
+  // already spaced apart, so no overlap — they wave across the gap). This runs
+  // once per cube per LCD tick at a low probability per pair (spec A2).
+  const INTERACT_CHANCE = 0.02;
+  function tickInteractions(cube) {
+    if (cube.asleep) return;
+    const list = occupantsOf(cube).filter(c => c.state === 'idle');
+    if (list.length < 2) return;
+    for (let i = 0; i < list.length; i++)
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i], b = list[j];
+        if (Math.random() < INTERACT_CHANCE) {
+          a.facing = b.x >= a.x ? 1 : -1; b.facing = a.x >= b.x ? 1 : -1;
+          a.state = b.state = 'interacting';
+          setAnim(a, 'wave', true); setAnim(b, 'wave', true);
+          a.think = b.think = 8;                    // ticks (~1.3s)
+          const icon = pick(['heart', 'note', 'exclaim']);
+          a.emote = { icon, t: 8 };
+          sfx.greet();
         }
+      }
+  }
+
+  // advance one cube — and every character currently inside it — by exactly
+  // one LCD tick. All screen-visible state (frames, positions, doors, blind,
+  // boot, trick progress, timers) changes only here.
+  function tickCube(cube) {
+    layoutCube(cube);                                // keep lanes fresh before movement
+    if (cube.boot) {
+      cube.boot.t++;
+      if (cube.boot.t >= cube.boot.dur) cube.boot = null;
     }
+    if (cube.asleep) {
+      // occupants still need their frame reset to idle, but nothing else advances
+      for (const ch of occupantsOf(cube)) setAnim(ch, 'idle');
+    } else {
+      for (const ch of occupantsOf(cube)) {
+        tickChar(ch, cube);
+        if (ch.emote) { ch.emote.t--; if (ch.emote.t <= 0) ch.emote = null; }
+      }
+      tickInteractions(cube);
+    }
+    // doors / hatches open while a character is crossing that edge, else shut —
+    // integer 0..DOOR_STEPS, one step per tick
+    for (const edge of ['left', 'right', 'top', 'bottom']) {
+      const want = edgeActive(cube, edge) ? DOOR_STEPS : 0;
+      if (cube.door[edge] < want) cube.door[edge]++;
+      else if (cube.door[edge] > want) cube.door[edge]--;
+    }
+    // Venetian blind lowers over an emptied, still-connected cube — BLIND_STEP
+    // rows per tick, integer 0..LCD
+    const blindTarget = (cube.occupants.length === 0 && cubeConnected(cube)) ? LCD : 0;
+    if (cube.blind < blindTarget) cube.blind = Math.min(LCD, cube.blind + BLIND_STEP);
+    else if (cube.blind > blindTarget) cube.blind = Math.max(0, cube.blind - BLIND_STEP);
   }
 
   function updateChars(dt) {
-    for (const cube of cubes) layoutCube(cube);     // keep lanes fresh
-    for (const ch of chars) {
-      updateChar(ch, dt);
-      if (ch.emote) { ch.emote.t -= dt; if (ch.emote.t <= 0) ch.emote = null; }
+    // per-cube LCD tick accumulator — each cube advances independently so
+    // cubes don't visibly lockstep (A1). Screen content is bit-identical
+    // between ticks; only the accumulator changes every rAF frame.
+    for (const cube of cubes) {
+      cube.tickT += dt;
+      while (cube.tickT >= LCD_TICK) {
+        cube.tickT -= LCD_TICK;
+        cube.ticks++;
+        tickCube(cube);
+      }
     }
-    detectInteractions();
   }
 
   function updateCubes(dt) {
+    // physical-world / UI-chrome timers only — smooth at 60fps (housing shake,
+    // magnetic-latch pulse, toast slide/fade, sleep countdown).
     for (const cube of cubes) {
       if (cube.wiggle > 0) cube.wiggle = Math.max(0, cube.wiggle - dt);
-      // power-on boot wipe
-      if (cube.boot) { cube.boot.t += dt; if (cube.boot.t >= cube.boot.dur) cube.boot = null; }
-      // doors / hatches open while a character is crossing that edge, else shut
-      for (const edge of ['left', 'right', 'top', 'bottom']) {
-        const dt2 = edgeActive(cube, edge) ? 1 : 0;
-        cube.door[edge] += clamp(dt2 - cube.door[edge], -1, 1) * Math.min(1, dt / 150);
-      }
-      // Venetian blind lowers over an emptied, still-connected cube
-      const target = (cube.occupants.length === 0 && cubeConnected(cube)) ? 1 : 0;
-      cube.blind += clamp(target - cube.blind, -1, 1) * Math.min(1, dt / 260);
+      if (cube.connFlash > 0) cube.connFlash = Math.max(0, cube.connFlash - dt);
+      if (cube._pressT > 0) cube._pressT = Math.max(0, cube._pressT - dt);
       // sleep timer
       cube.idle += dt;
       if (!cube.asleep && cube.idle > SLEEP_IDLE) cube.asleep = true;
-      // game-name caption
+      // game-name caption chip (C2 — floating UI chrome, smooth)
       if (cube.toast) { cube.toast.t -= dt; if (cube.toast.t <= 0) cube.toast = null; }
     }
   }
@@ -588,8 +688,8 @@
       if (Math.random() < 0.5 && TRICKS[ch.trick]) { startTrick(ch, cube); }
       else {
         ch.act = null; ch.state = 'acting'; setAnim(ch, pick(['mad', 'wave', 'bend']), true);
-        ch.emote = { icon: 'exclaim', t: 700 };
-        ch.think = 700;
+        ch.emote = { icon: 'exclaim', t: 4 };
+        ch.think = 4;
       }
     }
     sfx.poke();
@@ -598,7 +698,7 @@
   function shakeAll() {
     ensureAudio();
     for (const cube of cubes) { cube.wiggle = 500; wakeCube(cube); }
-    for (const ch of chars) { ch.act = null; ch.yOff = 0; ch.dizzy = rand(1400, 2200); ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.emote = null; }
+    for (const ch of chars) { ch.act = null; ch.yOff = 0; ch.dizzy = irand(9, 14); ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.emote = null; }
     sfx.dizzy();
   }
 
@@ -634,6 +734,10 @@
   function blitIcon(plane, icon, cx, topY) {
     const bmp = EMOTES[icon]; if (!bmp) return;
     const w = bmp[0].length, left = Math.round(cx - w / 2);
+    // C5: shift the whole icon down instead of clipping rows above the top
+    // edge — a poke near the top of the screen used to lose the emote
+    // entirely; now it's always fully visible, just closer to the figure.
+    if (topY < 0) topY = 0;
     for (let j = 0; j < bmp.length; j++)
       for (let i = 0; i < w; i++)
         if (bmp[j].charCodeAt(i) === 49) {
@@ -713,7 +817,7 @@
     const ph = clamp(ch.trickDur ? ch.trickT / ch.trickDur : 0, 0, 1);
     if (!t) { blitFrame(plane, CW_ANIM.idle[0], ch.x, FLOOR_Y, ch.facing); return; }
     const seq = CW_ANIM[bodyToAnim(t.body)] || CW_ANIM.idle;
-    const fi = seq[Math.floor(ch.trickT / FRAME_MS) % seq.length];
+    const fi = seq[ch.trickT % seq.length];          // ch.trickT is a tick count now
     let bob = 0;
     if (t.body === 'jump') bob = -Math.round(Math.abs(Math.sin(ph * (t.prop === 'rope' ? 6 : 3) * Math.PI)) * 4);
     blitFrame(plane, fi, ch.x, FLOOR_Y + bob, ch.facing);
@@ -728,6 +832,13 @@
     return (h % 5 !== 0) ? 1 : 0;                      // most segments on, some gaps
   }
   function drawBoot(plane, cube) {
+    // B3: wake-from-sleep power-flash — a short flash-only variant of boot
+    // (no maze, just an all-ON flash for the first couple ticks then live).
+    if (cube.boot.flash) {
+      if (cube.boot.t < BOOT_FLASH_TICKS - 1) { plane.fill(1); return; }
+      composeLive(plane, cube);
+      return;
+    }
     const ph = clamp(cube.boot.t / cube.boot.dur, 0, 1);
     if (ph < 0.12) { plane.fill(1); return; }          // all-segments power-on flash
     if (ph < 0.48) {                                    // maze builds top → bottom
@@ -782,14 +893,18 @@
 
   // draw scene background + occupant figures/props
   function composeLive(plane, cube) {
-    if (cube.scene) drawScene(plane, cube.scene);
+    if (cube.scene) drawScene(plane, cube.scene, cube.ticks);
     // doors / hatches sit behind the figures so a character passes in front
     for (const edge of ['left', 'right', 'top', 'bottom'])
-      if (cube.door[edge] > 0.02) drawPortal(plane, edge, cube.door[edge]);
+      if (cube.door[edge] > 0) drawPortal(plane, edge, cube.door[edge] / DOOR_STEPS);
     for (const ch of occupantsOf(cube)) {
       if (ch.state === 'trick') { drawTrick(plane, ch); continue; }
+      // B4: while clambering through a hatch, alternate the arms-up traced
+      // pose (frame 21) with the current walk frame instead of the plain seq.
+      const climbing = ((ch.state === 'entering' && ch.transAxis === 'v' && ch.yOff !== 0) ||
+        (ch.state === 'transfer' && ch.transAxis === 'v' && ch.transPhase === 'cross'));
       const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
-      const frameIndex = seq[clamp(ch.frame, 0, seq.length - 1)];
+      const frameIndex = climbing && ch.clamber ? 21 : seq[clamp(ch.frame, 0, seq.length - 1)];
       const baseY = FLOOR_Y + (ch.yOff || 0);
       blitFrame(plane, frameIndex, ch.x, baseY, ch.facing);
       if (ch.emote) blitIcon(plane, ch.emote.icon, ch.x, baseY - 24);
@@ -803,11 +918,21 @@
     if (cube.boot) { drawBoot(plane, cube); return plane; }
     if (cube.asleep) return plane;        // asleep = blank pale screen (segments off)
     composeLive(plane, cube);
+    // A4: Venetian blind is drawn as LCD pixels, not a canvas overlay — striped
+    // black shutter (every 4th row left as a pale slat gap) lowering per tick.
+    if (cube.blind > 0) {
+      for (let y = 0; y < cube.blind; y++) {
+        if ((y & 3) === 3) continue;               // slat gap every 4th row
+        for (let x = 0; x < LCD; x++) plane[y * LCD + x] = 1;
+      }
+    }
     return plane;
   }
 
   // ---- jumbo-cube scene backgrounds (original art capturing the video scenes) --
-  function drawScene(plane, kind) {
+  // `ticks` is the owning cube's LCD tick counter — scene motion steps once
+  // per tick (A2), never smoothly between ticks.
+  function drawScene(plane, kind, ticks) {
     const on = (x, y) => { x = Math.round(x); y = Math.round(y); if (x >= 0 && x < LCD && y >= 0 && y < LCD) plane[y * LCD + x] = 1; };
     if (kind === 'beach') {
       // palm trunk, curving up the left with ring texture
@@ -820,7 +945,7 @@
       // two coconuts under the fronds
       on(hx + 1, hy + 2); on(hx + 2, hy + 2); on(hx + 4, hy + 3); on(hx + 5, hy + 3);
       // sky: slow day/night cycle — crescent moon by night, rayed sun by day
-      const night = ((animClock / 15000) % 1) < 0.5;
+      const night = ((ticks / 94) % 1) < 0.5;       // ~15000ms / LCD_TICK cycle
       if (night) {
         for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) {
           const d = xx * xx + yy * yy, d2 = (xx + 2) * (xx + 2) + yy * yy;
@@ -831,18 +956,18 @@
         for (const [dx, dy] of [[-4, 0], [4, 0], [0, -4], [0, 4], [-3, -3], [3, 3], [3, -3], [-3, 3]]) on(26 + dx, 7 + dy);
       }
       // a bird drifting across the sky
-      const brd = 8 + ((animClock / 190 | 0) % 20);
+      const brd = 8 + (ticks % 20);
       on(brd, 5); on(brd + 1, 4); on(brd + 2, 5); on(brd + 5, 6); on(brd + 6, 5); on(brd + 7, 6);
       // little beach hut on the right
       for (let x = 22; x <= 28; x++) on(x, FLOOR_Y - 3);                 // roof line
       on(21, FLOOR_Y - 2); on(29, FLOOR_Y - 2);
       for (let y = FLOOR_Y - 2; y <= FLOOR_Y; y++) { on(22, y); on(28, y); }
       // shoreline (rolling dashed surf)
-      for (let x = 0; x < LCD; x++) if ((x + (animClock / 400 | 0)) % 3 !== 0) on(x, FLOOR_Y + 1);
+      for (let x = 0; x < LCD; x++) if ((x + Math.floor(ticks / 2.5)) % 3 !== 0) on(x, FLOOR_Y + 1);
     } else if (kind === 'city') {
       // skyline of buildings with lit windows
       const b = [[0, 15], [6, 8], [11, 19], [16, 6], [22, 12], [27, 17]];
-      const tw = Math.floor(animClock / 650);
+      const tw = Math.floor(ticks / 4);              // ~650ms / LCD_TICK cycle
       for (const [bx, top] of b) {
         for (let y = top; y <= FLOOR_Y; y++) { on(bx, y); on(bx + 4, y); }
         for (let x = bx; x <= bx + 4; x++) on(x, top);
@@ -856,13 +981,19 @@
       for (let y = 12; y <= FLOOR_Y; y++) { on(lx, y); on(lx + 2, y); if ((y & 1) === 0) on(lx + 1, y); }
       for (let x = 0; x < LCD; x++) on(x, FLOOR_Y + 1);                  // street
       // a little taxi cruising the street
-      const car = -6 + ((animClock / 130 | 0) % 44);
+      const car = -6 + (ticks % 44);
       for (let x = 0; x < 7; x++) on(car + x, FLOOR_Y);
       on(car + 1, FLOOR_Y - 1); on(car + 5, FLOOR_Y - 1);
     }
   }
 
-  function drawScreen(cube, sx, sy) {
+  // A3: STN ghosting decay factor for this render frame — half-life ~90ms.
+  // Real STN pixels don't snap off; they fade. lum stays 1 while a dot is ON
+  // and decays exponentially once it switches OFF, giving moving figures a
+  // subtle brief trail between LCD ticks.
+  function decayFactor(dt) { return Math.pow(0.5, dt / GHOST_HALF_LIFE); }
+
+  function drawScreen(cube, sx, sy, dt) {
     const S = SCREEN_PX;
     const w = cube.jumbo ? WELL + 5 : WELL;          // jumbo cubes: deeper frame
     // deep recessed near-black well around the LCD
@@ -882,21 +1013,23 @@
     roundRect(ctx, sx, sy, S, S, 2); ctx.clip();
     ctx.save(); ctx.translate(sx, sy); ctx.fillStyle = matrixTile; ctx.fillRect(0, 0, S, S); ctx.restore();
 
-    // ON pixels
+    // ON pixels, with STN ghosting (A3): the plane itself is bit-identical
+    // between LCD ticks, but lum decays every render frame so a dot that just
+    // switched off keeps a fading trace instead of vanishing instantly.
     const plane = composePlane(cube);
-    ctx.fillStyle = LCD_ON;
+    const lum = cube.lum, decay = decayFactor(dt);
     for (let y = 0; y < LCD; y++)
-      for (let x = 0; x < LCD; x++)
-        if (plane[y * LCD + x]) ctx.fillRect(sx + x * DOT, sy + y * DOT, DOT - 1, DOT - 1);
-
-    // window-blind cover lowering over an emptied cube
-    if (cube.blind > 0.02) {
-      const h = S * cube.blind;
-      ctx.fillStyle = 'rgba(126,138,108,0.9)';
-      ctx.fillRect(sx, sy, S, h);
-      ctx.fillStyle = 'rgba(70,78,58,0.85)';
-      for (let yy = 0; yy < h; yy += DOT * 2) ctx.fillRect(sx, sy + yy, S, 1);
-    }
+      for (let x = 0; x < LCD; x++) {
+        const idx = y * LCD + x;
+        if (plane[idx]) lum[idx] = 1;
+        else if (lum[idx] > 0) lum[idx] *= decay;
+        const l = lum[idx];
+        if (l < 0.04) continue;
+        ctx.globalAlpha = Math.min(1, l);
+        ctx.fillStyle = LCD_ON;
+        ctx.fillRect(sx + x * DOT, sy + y * DOT, DOT - 1, DOT - 1);
+      }
+    ctx.globalAlpha = 1;
 
     // glass sheen
     ctx.fillStyle = LCD_GLASS;
@@ -906,17 +1039,21 @@
     ctx.restore();
   }
 
-  // one grey pressable button on the control deck
-  function drawButton(x, y, w, h) {
-    roundRect(ctx, x, y + 2, w, h, 3); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();   // shadow
+  // one grey pressable button on the control deck. B5: while pressed, it
+  // renders shifted 1px down with a darker gradient (no shadow, since it's
+  // sunk in).
+  function drawButton(x, y, w, h, pressed) {
+    if (pressed) y += 1;
+    else { roundRect(ctx, x, y + 2, w, h, 3); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill(); }   // shadow
     roundRect(ctx, x, y, w, h, 3);
     const g = ctx.createLinearGradient(0, y, 0, y + h);
-    g.addColorStop(0, '#e9e6da'); g.addColorStop(1, '#bcb9ac');
+    if (pressed) { g.addColorStop(0, '#b5b2a5'); g.addColorStop(1, '#8f8c81'); }
+    else { g.addColorStop(0, '#e9e6da'); g.addColorStop(1, '#bcb9ac'); }
     ctx.fillStyle = g; ctx.fill();
     ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.stroke();
   }
 
-  function drawCube(cube) {
+  function drawCube(cube, dt) {
     const shake = cube.wiggle > 0 ? Math.sin(cube.wiggle * 0.09) * (cube.wiggle / 500) * 4 : 0;
     const x = Math.round(cube.x + shake), y = Math.round(cube.y);
     ctx.save();
@@ -939,31 +1076,42 @@
     if (cube.housing.translucent) { ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(4, CUBE_SIZE * 0.4, CUBE_SIZE - 8, CUBE_SIZE * 0.55); }
     ctx.restore();
 
-    drawScreen(cube, SCREEN_X, SCREEN_Y);
+    drawScreen(cube, SCREEN_X, SCREEN_Y, dt);
 
-    // ---- control deck: molded game-icon + three buttons ----
+    // ---- control deck: molded game-icon (never swapped — see C2) + three buttons ----
     const deckTop = SCREEN_Y + SCREEN_PX + WELL + 1;
-    // molded game-icon (or ▶ game caption when a trick fires)
-    if (cube.toast) {
-      ctx.font = 'bold 9px "Courier New", monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillText('▶ ' + cube.toast.text.toUpperCase(), CUBE_SIZE / 2, deckTop + 6);
-      ctx.textBaseline = 'alphabetic';
-    } else {
-      drawGameIcon(cube.icon, CUBE_SIZE / 2, deckTop + 6, cube.housing.dark);
+    drawGameIcon(cube.icon, CUBE_SIZE / 2, deckTop + 6, cube.housing.dark);
+    // three buttons (B5: functional — play / greet / power)
+    const rects = buttonRects(cube);
+    for (let i = 0; i < 3; i++) {
+      const r = rects[i];
+      const pressed = cube._pressBtn === i && cube._pressT > 0;
+      drawButton(r.x, r.y, r.w, r.h, pressed);
     }
-    // three buttons
-    const bw = 34, bh = 11, gap = 8, total = bw * 3 + gap * 2;
-    const bx0 = (CUBE_SIZE - total) / 2, by = deckTop + 15;
-    for (let i = 0; i < 3; i++) drawButton(bx0 + i * (bw + gap), by, bw, bh);
     // tiny character name under the buttons
     ctx.font = '8px "Courier New", monospace'; ctx.textAlign = 'center';
     ctx.fillStyle = cube.housing.translucent ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.7)';
-    ctx.fillText(cube.housing.name.toUpperCase(), CUBE_SIZE / 2, by + bh + 9);
+    ctx.fillText(cube.housing.name.toUpperCase(), CUBE_SIZE / 2, rects[0].y + rects[0].h + 9);
 
     // collector series badge, top-left corner
     drawSeriesBadge(cube);
 
     ctx.restore();
+
+    // ---- physical-world chrome drawn outside the cube's local transform ----
+    if (cube.toast) drawToastChip(cube, x, y);        // C2: floating game-name chip
+    if (cube._hover) drawRemoveChip(cube, x, y);       // B6: hover ✕ chip
+  }
+
+  // B5: the three control-deck button rects, shared by drawCube (rendering)
+  // and the pointerdown hit-test — single source of truth for hit geometry.
+  function buttonRects(cube) {
+    const deckTop = SCREEN_Y + SCREEN_PX + WELL + 1;
+    const bw = 34, bh = 11, gap = 8, total = bw * 3 + gap * 2;
+    const bx0 = (CUBE_SIZE - total) / 2, by = deckTop + 15;
+    const out = [];
+    for (let i = 0; i < 3; i++) out.push({ x: bx0 + i * (bw + gap), y: by, w: bw, h: bh });
+    return out;
   }
 
   // small molded pictograms for the control-deck game icon
@@ -1022,18 +1170,68 @@
     if (s.startsWith('Jumbo')) return 'JMB';
     return '?';
   }
+  // C1: a solid collector sticker — cream on plastic, gold for Special
+  // Editions — legible against every housing colour (the old translucent
+  // black chip washed out on dark plastics).
   function drawSeriesBadge(cube) {
     const tag = seriesTag(cube.housing);
     ctx.font = 'bold 9px "Courier New", monospace';
     const w = ctx.measureText(tag).width + 9, bx = 7, by = 6, h = 13;
     roundRect(ctx, bx, by, w, h, 3);
-    ctx.fillStyle = cube.housing.se ? '#ffe14d' : 'rgba(0,0,0,0.38)';
+    ctx.fillStyle = cube.housing.se ? '#ffe14d' : '#efe9d6';
     ctx.fill();
-    ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.stroke();
-    ctx.fillStyle = cube.housing.se ? '#7a4a00' : 'rgba(255,255,255,0.95)';
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.stroke();
+    ctx.fillStyle = cube.housing.se ? '#4a3200' : '#33301f';
     ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
     ctx.fillText(tag, bx + 4, by + h / 2 + 0.5);
     ctx.textBaseline = 'alphabetic';
+  }
+
+  // C2: the molded deck icon never changes (it's molded plastic) — the game
+  // name instead floats as a cream sticker chip above the cube, sliding down
+  // 4px and fading in over its first 120ms, then fading out at end of life.
+  function drawToastChip(cube, x, y) {
+    const toast = cube.toast;
+    const age = toast.dur - toast.t;                 // ms since it appeared
+    const fadeIn = clamp(age / 120, 0, 1);
+    const fadeOut = clamp(toast.t / 250, 0, 1);
+    const alpha = Math.min(fadeIn, fadeOut);
+    if (alpha <= 0) return;
+    const slide = (1 - fadeIn) * -4;                  // slides down into place
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = 'bold 10px "Courier New", monospace';
+    const text = '▶ ' + toast.text.toUpperCase();
+    const w = ctx.measureText(text).width + 14, h = 16;
+    const cx = x + CUBE_SIZE / 2;
+    let cy = y - 12 + slide;
+    if (cy < h / 2 + 2) cy = h / 2 + 2;               // keep chip from clipping off canvas top
+    roundRect(ctx, cx - w / 2, cy - h / 2, w, h, 4);
+    ctx.fillStyle = '#efe9d6'; ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.stroke();
+    ctx.fillStyle = '#33301f';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, cx, cy + 0.5);
+    ctx.restore();
+  }
+
+  // B6: a small round ✕ chip at the cube's top-right housing corner while
+  // hovered — click removes the cube. Shares geometry with the pointerdown
+  // hit-test via the same (x, y) the caller used to draw the housing.
+  function removeChipRect(x, y) {
+    return { cx: x + CUBE_SIZE - 12, cy: y + 12, r: 7 };
+  }
+  function drawRemoveChip(cube, x, y) {
+    const { cx, cy, r } = removeChipRect(x, y);
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#7a1f1a'; ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.stroke();
+    ctx.strokeStyle = '#f2ece0'; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+    const d = 2.6;
+    ctx.beginPath(); ctx.moveTo(cx - d, cy - d); ctx.lineTo(cx + d, cy + d); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + d, cy - d); ctx.lineTo(cx - d, cy + d); ctx.stroke();
+    ctx.restore();
   }
 
   function lighten(hex, amt) {
@@ -1045,20 +1243,39 @@
     return `rgb(${r},${g},${b})`;
   }
 
-  function drawConnectionGlow() {
-    const span = 44;
-    for (const cube of cubes) {
-      ctx.fillStyle = 'rgba(255,242,168,0.8)';
-      if (cube.conn.right) ctx.fillRect(cube.x + CUBE_SIZE - 4, cube.y + CUBE_SIZE / 2 - span / 2, 8, span);
-      if (cube.conn.bottom) ctx.fillRect(cube.x + CUBE_SIZE / 2 - span / 2, cube.y + CUBE_SIZE - 4, span, 8);
+  // B7: a small "magnetic latch" straddling each connected seam, drawn AFTER
+  // all cubes so it's visible when they sit flush (the old glow drew under
+  // the cubes and was invisible). On a *new* connection the cube gets a brief
+  // connFlash pulse — a soft glow around the latch that fades out.
+  function drawConnectionLatch(cube) {
+    const pulse = cube.connFlash > 0 ? cube.connFlash / 600 : 0;
+    for (const edge of ['right', 'bottom']) {
+      if (!cube.conn[edge]) continue;
+      const vertical = edge === 'right';
+      const w = vertical ? 10 : 28, h = vertical ? 28 : 10;
+      const cx = vertical ? cube.x + CUBE_SIZE : cube.x + CUBE_SIZE / 2;
+      const cy = vertical ? cube.y + CUBE_SIZE / 2 : cube.y + CUBE_SIZE;
+      const x = cx - w / 2, y = cy - h / 2;
+      if (pulse > 0) {
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,217,77,0.9)';
+        ctx.shadowBlur = 14 * pulse;
+        ctx.globalAlpha = 0.5 + 0.5 * pulse;
+        roundRect(ctx, x, y, w, h, 4);
+        ctx.fillStyle = '#ffd94d'; ctx.fill();
+        ctx.restore();
+      }
+      roundRect(ctx, x, y, w, h, 4);
+      ctx.fillStyle = '#ffd94d'; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(0,0,0,0.45)'; ctx.stroke();
     }
   }
 
-  function render() {
+  function render(dt) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, CSS_W, CSS_H);
-    drawConnectionGlow();
-    for (const cube of cubes) drawCube(cube);
+    for (const cube of cubes) drawCube(cube, dt);
+    for (const cube of cubes) drawConnectionLatch(cube);   // physical-world chrome, drawn on top
   }
 
   // ================================================================= INPUT
@@ -1089,11 +1306,92 @@
     return best;
   }
 
+  // B5: hit-test the three deck buttons in cube-local coordinates, sharing
+  // buttonRects() with the renderer so hit geometry never drifts from paint.
+  function buttonAt(cube, px, py) {
+    const lx = px - cube.x, ly = py - cube.y;
+    const rects = buttonRects(cube);
+    for (let i = 0; i < rects.length; i++) {
+      const r = rects[i];
+      if (lx >= r.x && lx <= r.x + r.w && ly >= r.y && ly <= r.y + r.h) return i;
+    }
+    return -1;
+  }
+  // B6: hit-test the hover ✕ removal chip in world coordinates.
+  function removeChipAt(cube, px, py) {
+    const { cx, cy, r } = removeChipRect(cube.x, cube.y);
+    return Math.hypot(px - cx, py - cy) <= r + 2;
+  }
+
+  function pressButton(cube, i) {
+    cube._pressBtn = i; cube._pressT = 150;
+    if (i === 2) {                                    // power: sleep toggle
+      if (cube.asleep) wakeCube(cube);                // B3: wake plays the power-flash
+      else { cube.asleep = true; cube.boot = null; }
+      sfx.poke();
+      return;
+    }
+    wakeCube(cube);
+    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer');
+    if (i === 0) {                                    // play signature game
+      if (occ.length) { const ch = pick(occ); if (TRICKS[ch.trick]) startTrick(ch, cube); }
+    } else if (i === 1) {                              // greet: wave + note emote
+      if (occ.length) {
+        const ch = pick(occ);
+        ch.act = null; ch.state = 'acting'; setAnim(ch, 'wave', true);
+        ch.emote = { icon: 'note', t: 6 };
+        ch.think = 6;
+      }
+      sfx.greet();
+    }
+  }
+
+  // B6: remove a cube — characters homed there are deleted outright; visiting
+  // characters currently inside it are sent home via the existing dissolve
+  // logic (they can't dissolve into a cube that no longer exists, so we route
+  // them home first, then drop the cube).
+  function removeCube(cube) {
+    for (const ch of chars.slice()) {
+      if (ch.homeId === cube.id) {
+        const idx = chars.indexOf(ch);
+        if (idx >= 0) chars.splice(idx, 1);
+        for (const c of cubes) {
+          const oi = c.occupants.indexOf(ch.id);
+          if (oi >= 0) c.occupants.splice(oi, 1);
+        }
+      }
+    }
+    for (const ch of chars) {
+      if (ch.cubeId === cube.id && ch.homeId !== cube.id) {
+        const oi = cube.occupants.indexOf(ch.id);
+        if (oi >= 0) cube.occupants.splice(oi, 1);
+        const home = cubeById(ch.homeId);
+        if (home && !home.occupants.includes(ch.id)) home.occupants.push(ch.id);
+        ch.cubeId = ch.homeId;
+        ch.state = 'idle'; ch.anim = 'idle'; ch.frame = 0;
+        ch.act = null; ch.oneShot = null; ch.yOff = 0; ch.transPhase = null;
+        ch.x = rand(9, 23); ch.emote = null;
+      }
+    }
+    const ci = cubes.indexOf(cube);
+    if (ci >= 0) cubes.splice(ci, 1);
+    recomputeConnections();
+    dissolveOrphans();
+    sfx.dissolve();
+  }
+
   canvas.addEventListener('pointerdown', e => {
     ensureAudio();
     const p = toLocal(e);
     const cube = cubeAt(p.x, p.y);
     if (!cube) return;
+
+    // B6: click the hover removal chip — never starts a drag or counts as a poke.
+    if (cube._hover && removeChipAt(cube, p.x, p.y)) { removeCube(cube); return; }
+    // B5: click a deck button — never starts a drag or counts as a poke.
+    const btn = buttonAt(cube, p.x, p.y);
+    if (btn >= 0) { pressButton(cube, btn); return; }
+
     canvas.setPointerCapture(e.pointerId);
     cubes.splice(cubes.indexOf(cube), 1); cubes.push(cube);
     drag = { cube, ox: p.x - cube.x, oy: p.y - cube.y, moved: false, sx: p.x, sy: p.y,
@@ -1103,8 +1401,14 @@
   });
 
   canvas.addEventListener('pointermove', e => {
-    if (!drag) return;
     const p = toLocal(e);
+    // B6: track hover (even when not dragging) so the removal chip only
+    // shows on the cube under the pointer.
+    if (!drag) {
+      const hoverCube = cubeAt(p.x, p.y);
+      for (const c of cubes) c._hover = (c === hoverCube);
+      return;
+    }
     if (!drag.moved && Math.hypot(p.x - drag.sx, p.y - drag.sy) > 5) drag.moved = true;
     if (!drag.moved) return;
 
@@ -1114,7 +1418,7 @@
     const sp = Math.hypot(vx, vy);
     drag.shake = drag.shake * 0.85 + sp * 0.15;
     if (drag.shake > 2.2) {
-      for (const ch of drag.cube.occupants.map(cubeById2)) if (ch && ch.dizzy <= 0) { ch.act = null; ch.yOff = 0; ch.dizzy = 1500; ch.state = 'dizzy'; setAnim(ch, 'dizzy'); }
+      for (const ch of drag.cube.occupants.map(cubeById2)) if (ch && ch.dizzy <= 0) { ch.act = null; ch.yOff = 0; ch.dizzy = 9; ch.state = 'dizzy'; setAnim(ch, 'dizzy'); }
       drag.cube.wiggle = 260;
       if (Math.random() < 0.06) sfx.dizzy();
     }
@@ -1132,6 +1436,7 @@
     drag.conn = nc;
     dissolveOrphans();
   });
+  canvas.addEventListener('pointerleave', () => { for (const c of cubes) c._hover = false; });
 
   function cubeById2(id) { return chars.find(c => c.id === id); }
 
@@ -1156,8 +1461,10 @@
   });
   resetBtn.addEventListener('click', () => {
     if (!window.confirm('Clear the sandbox and start over?')) return;
-    cubes = []; chars = []; cubeSeq = charSeq = 1; rosterBag = [];
-    initWorld(); updateAddBtn();
+    // C5: clear arrays IN PLACE (not reassign) so window.__cw.cubes/chars keep
+    // pointing at the live arrays after a reset.
+    cubes.length = 0; chars.length = 0; cubeSeq = charSeq = 1; rosterBag = [];
+    initWorld();
   });
 
   // ------------------------------------------------------------------ boot
@@ -1186,21 +1493,22 @@
   function tick(t) {
     if (last == null) last = t;
     const dt = Math.min(t - last, 60); last = t;
-    animClock += dt;
     updateChars(dt);
     updateCubes(dt);
-    render();
+    render(dt);
     requestAnimationFrame(tick);
   }
 
   resize();
   initWorld();
-  updateAddBtn();
   requestAnimationFrame(tick);
 
   // debug hook
   window.__cw = { cubes, chars, CSS_W: () => CSS_W, CSS_H: () => CSS_H,
-    ff: n => { for (let i = 0; i < n; i++) { updateChars(FRAME_MS); updateCubes(FRAME_MS); } },
+    // advance every cube by exactly n LCD ticks, deterministically — calls
+    // the same tickCube() path the real rAF loop uses, bypassing the
+    // accumulator so tests don't depend on wall-clock frame timing.
+    ff: n => { for (let i = 0; i < n; i++) for (const cube of cubes) { cube.ticks++; tickCube(cube); } },
     recompute: recomputeConnections,
     forceTransfer: (charIdx, edge) => { const ch = chars[charIdx]; beginTransfer(ch, cubeById(ch.cubeId), edge); },
     startAct: (charIdx, key) => startAct(chars[charIdx], key),
@@ -1219,7 +1527,7 @@
     },
     trickAscii: (key, ph) => {
       const plane = new Uint8Array(LCD * LCD);
-      const ch = { x: 16, facing: 1, trick: key, trickT: ph * 2800, trickDur: 2800 };
+      const ch = { x: 16, facing: 1, trick: key, trickT: Math.round(ph * TRICK_TICKS), trickDur: TRICK_TICKS };
       drawTrick(plane, ch);
       let out = '';
       for (let y = 0; y < LCD; y++) { for (let x = 0; x < LCD; x++) out += plane[y * LCD + x] ? '#' : '.'; out += '\n'; }

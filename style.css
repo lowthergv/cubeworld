@@ -42,6 +42,33 @@ body {
 }
 .spacer { flex: 1 1 auto; }
 
+/* wordmark: reads like the toy's own LCD-green branding */
+#brand {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #9aa886;
+  margin-right: 10px;
+  white-space: nowrap;
+}
+#brand sup { font-size: 8px; letter-spacing: 0; }
+
+/* control-bar hint — hidden on narrow viewports so it never crowds the buttons */
+#hint {
+  font-size: 11px;
+  opacity: 0.55;
+  margin-right: 10px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 700px) {
+  #hint { display: none; }
+}
+
 .btn {
   font: inherit;
   font-size: 12px;
@@ -52,6 +79,7 @@ body {
   background: #23261b;
   color: #c9cbb8;
   cursor: pointer;
+  white-space: nowrap;
   transition: background 0.12s ease, border-color 0.12s ease;
 }
 .btn:hover { background: #2c3022; border-color: #4a4e3a; }
