@@ -64,7 +64,7 @@ unchecked item, implement it completely, verify it, log it, commit it.
 The real toy's heart: every character has a built-in 3-button game. We build
 the game engine and cover the whole roster with our own LCD art.
 
-- [ ] **P1.1 Game engine core** — `cube.game` state machine entered/exited
+- [x] **P1.1 Game engine core** — `cube.game` state machine entered/exited
   via deck button 0: countdown (3-2-1 on LCD), play, game-over. A 3×5 LCD
   digit font for score, rendered on the plane. A reusable "timing press"
   primitive (moving object + press window + hit/miss judgment). Miss = trip/

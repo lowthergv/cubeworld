@@ -120,6 +120,10 @@
     dizzy:   () => { beep(400, 0.1, 0, 0.05, 'sawtooth'); beep(300, 0.12, 0.08, 0.05, 'sawtooth'); },
     add:     () => { beep(587, 0.05); beep(880, 0.08, 0.05); },
     dissolve:() => { beep(700, 0.05); beep(440, 0.08, 0.05); },
+    count:   () => beep(587, 0.06),
+    hit:     () => { beep(880, 0.05); beep(1175, 0.07, 0.05); },
+    miss:    () => beep(220, 0.16, 0, 0.06, 'sawtooth'),
+    over:    () => { beep(660, 0.08); beep(494, 0.08, 0.09); beep(330, 0.14, 0.18); },
   };
 
   // ----------------------------------------------------------- world model
@@ -236,6 +240,7 @@
     if (cur && cur !== home) {
       const idx = cur.occupants.indexOf(ch.id);
       if (idx >= 0) cur.occupants.splice(idx, 1);
+      if (cur.game && cur.game.charId === ch.id) endGame(cur, false);   // player left the cabinet
     }
     if (!home.occupants.includes(ch.id)) home.occupants.push(ch.id);
     ch.cubeId = ch.homeId;
@@ -467,6 +472,8 @@
       return;
     }
 
+    if (ch.state === 'gaming') return;                  // the game engine drives this figure
+
     if (ch.state === 'transfer') {
       const door = cube.door[ch.transEdge];             // integer 0..DOOR_STEPS
       if (ch.transAxis === 'h') {
@@ -643,6 +650,109 @@
     sfx.greet();
   }
 
+  // =============================================================== MINI-GAME
+  // P1.1: interactive game engine. Deck button 0 starts/quits a game on that
+  // cube; buttons 1/2 are game inputs while one runs. Presses latch between
+  // ticks and are judged on the next LCD tick, so gameplay is as chunky as
+  // the screen — like the real toy. The P1.1 primitive is a timing game: an
+  // object closes in, press while it's in the strike window.
+  const GAME_COUNTDOWN = 15;      // ticks of 3-2-1 (~2.4s)
+  const GAME_OVER_HOLD = 20;      // ticks the final score stays up
+  const GAME_MISSES = 3;
+  const GAME_WINDOW = 2;          // |obj.x - ch.x| <= this counts as a hit
+  const bestScores = new Map();   // roster index -> best score (P1.4 persists)
+
+  function gamePlayer(cube) {
+    if (!cube.game) return null;
+    const ch = chars.find(c => c.id === cube.game.charId);
+    return (ch && ch.cubeId === cube.id) ? ch : null;
+  }
+  function startGame(cube) {
+    if (cube.game || cube.asleep || cube.boot) return;
+    const occ = occupantsOf(cube).filter(c =>
+      c.state !== 'transfer' && c.state !== 'entering' && c.state !== 'gaming');
+    if (!occ.length) return;
+    const ch = occ.find(c => c.homeId === cube.id) || occ[0];   // the resident hosts
+    ch.act = null; ch.oneShot = null; ch.emote = null;
+    ch.state = 'gaming';
+    setAnim(ch, 'idle');
+    const rosterIdx = ROSTER.indexOf(ch.ident);
+    cube.game = {
+      charId: ch.id, phase: 'countdown', t: 0,
+      score: 0, misses: 0, speed: 1, pressed: 0,
+      best: bestScores.get(rosterIdx) || 0, rosterIdx,
+      obj: null,
+    };
+    wakeCube(cube);
+    sfx.count();
+  }
+  function endGame(cube, showScore) {
+    const g = cube.game;
+    if (!g) return;
+    cube.game = null;
+    const ch = chars.find(c => c.id === g.charId);
+    if (ch && ch.state === 'gaming') { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = irand(4, 10); }
+    if (showScore) {
+      const name = (TRICKS[cube.housing.trick] || {}).game || 'GAME';
+      cube.toast = { text: `${name} · ${g.score} PTS · BEST ${g.best}`, t: 3600, dur: 3600 };
+    }
+  }
+  function spawnObj(g) {
+    const fromLeft = Math.random() < 0.5;
+    g.obj = { x: fromLeft ? 1 : LCD - 2, dir: fromLeft ? 1 : -1, wait: 0 };
+  }
+  // one strike missed; true = that was the third, game over
+  function gameMiss(cube, g, ch) {
+    g.misses++;
+    setAnim(ch, 'dizzy', true);                       // stumble
+    sfx.miss();
+    if (g.misses >= GAME_MISSES) { g.phase = 'over'; g.t = 0; sfx.over(); return true; }
+    return false;
+  }
+  function tickGame(cube) {
+    const g = cube.game;
+    if (!g) return;
+    const ch = gamePlayer(cube);
+    if (!ch || ch.state !== 'gaming') { endGame(cube, false); return; }   // player got yanked
+    g.t++;
+    const pressed = g.pressed; g.pressed = 0;         // consume the latch
+    if (g.phase === 'countdown') {
+      // use the 3-2-1 to walk the player to centre stage
+      if (ch.x !== CENTER_X) {
+        ch.facing = ch.x <= CENTER_X ? 1 : -1;
+        ch.x = towardTick(ch.x, CENTER_X, WALK_DOTS);
+        setAnim(ch, 'walk');
+      } else if (ch.anim === 'walk') setAnim(ch, 'idle');
+      if (g.t % 5 === 0 && g.t < GAME_COUNTDOWN) sfx.count();
+      if (g.t >= GAME_COUNTDOWN) { g.phase = 'play'; g.t = 0; spawnObj(g); }
+      return;
+    }
+    if (g.phase === 'play') {
+      if (!ch.oneShot && ch.anim !== 'idle') setAnim(ch, 'idle');   // pose finished
+      const o = g.obj;
+      if (pressed) {
+        if (o.wait === 0 && Math.abs(o.x - ch.x) <= GAME_WINDOW) {  // HIT
+          g.score = Math.min(99, g.score + 1);
+          if (g.score > g.best) { g.best = g.score; bestScores.set(g.rosterIdx, g.best); }
+          if (g.score % 3 === 0) g.speed = Math.min(3, g.speed + 1);
+          o.wait = irand(5, 9);                       // ball is away; respawn soon
+          setAnim(ch, 'mad', true);                   // strike pose
+          sfx.hit();
+        } else if (gameMiss(cube, g, ch)) return;     // swung at nothing
+      }
+      if (o.wait > 0) { if (--o.wait === 0) spawnObj(g); return; }
+      o.x += o.dir * g.speed;
+      ch.facing = o.x >= ch.x ? 1 : -1;
+      if ((o.dir > 0 && o.x > ch.x + GAME_WINDOW) || (o.dir < 0 && o.x < ch.x - GAME_WINDOW)) {
+        const over = gameMiss(cube, g, ch);           // it clipped you
+        o.wait = irand(4, 8);
+        if (over) return;
+      }
+      return;
+    }
+    if (g.t >= GAME_OVER_HOLD) endGame(cube, true);   // 'over': hold, then bow out
+  }
+
   // co-occupants sharing a cube occasionally turn to greet each other (they're
   // already spaced apart, so no overlap — they wave across the gap). This runs
   // once per cube per LCD tick at a low probability per pair (spec A2).
@@ -683,6 +793,7 @@
         tickChar(ch, cube);
         if (ch.emote) { ch.emote.t--; if (ch.emote.t <= 0) ch.emote = null; }
       }
+      tickGame(cube);
       tickInteractions(cube);
     }
     // doors / hatches open while a character is crossing that edge, else shut —
@@ -720,9 +831,9 @@
       if (cube.wiggle > 0) cube.wiggle = Math.max(0, cube.wiggle - dt);
       if (cube.connFlash > 0) cube.connFlash = Math.max(0, cube.connFlash - dt);
       if (cube._pressT > 0) cube._pressT = Math.max(0, cube._pressT - dt);
-      // sleep timer
+      // sleep timer — dozing off powers the game down too
       cube.idle += dt;
-      if (!cube.asleep && cube.idle > SLEEP_IDLE) cube.asleep = true;
+      if (!cube.asleep && cube.idle > SLEEP_IDLE) { cube.asleep = true; if (cube.game) endGame(cube, false); }
       // game-name caption chip (C2 — floating UI chrome, smooth)
       if (cube.toast) { cube.toast.t -= dt; if (cube.toast.t <= 0) cube.toast = null; }
     }
@@ -732,8 +843,9 @@
     wakeCube(cube);
     cube.wiggle = 320;
     // a figure mid-doorway (transfer OR entering) can be off the 32-dot panel;
-    // hijacking it into a poke reaction would strand it off-screen.
-    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer' && c.state !== 'entering');
+    // hijacking it into a poke reaction would strand it off-screen. A gaming
+    // figure belongs to its game.
+    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer' && c.state !== 'entering' && c.state !== 'gaming');
     if (occ.length) {
       const ch = pick(occ);
       // a poke often coaxes out the character's signature trick
@@ -749,7 +861,7 @@
 
   function shakeAll() {
     ensureAudio();
-    for (const cube of cubes) { cube.wiggle = 500; wakeCube(cube); }
+    for (const cube of cubes) { cube.wiggle = 500; wakeCube(cube); if (cube.game) endGame(cube, false); }
     for (const ch of chars) {
       ch.act = null; ch.yOff = 0; ch.dizzy = irand(9, 14); ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.emote = null;
       // a shake can interrupt a figure mid-portal (x past the panel edge) —
@@ -869,6 +981,47 @@
     taxi(p, ch, ph) { stamp(p, PROP_BMP.taxi, Math.round(-6 + ph * 40), FLOOR_Y - 4); },
   };
 
+  // ---- LCD score digits (3x5 font from data.js, scalable) -----------------
+  function drawDigit(plane, d, x, y, s) {
+    const bmp = LCD_DIGITS[d]; if (!bmp) return;
+    for (let j = 0; j < 5; j++)
+      for (let i = 0; i < 3; i++)
+        if (bmp[j].charCodeAt(i) === 49)
+          for (let dy = 0; dy < s; dy++) for (let dx = 0; dx < s; dx++)
+            setOn(plane, x + i * s + dx, y + j * s + dy);
+  }
+  const numWidth = (n, s) => String(Math.max(0, n | 0)).length * 4 * s - s;
+  function drawNum(plane, n, x, y, s) {
+    for (const c of String(Math.max(0, n | 0))) { drawDigit(plane, +c, x, y, s); x += 4 * s; }
+  }
+
+  // ---- mini-game screen furniture (drawn over the live scene) -------------
+  function drawGameHud(plane, cube) {
+    const g = cube.game;
+    const ch = gamePlayer(cube);
+    if (!g || !ch) return;
+    if (g.phase === 'countdown') {                    // big 3-2-1 up top
+      const d = clamp(3 - Math.floor(g.t / 5), 1, 3);
+      drawDigit(plane, d, CENTER_X - 3, 2, 2);
+      return;
+    }
+    if (g.phase === 'play') {
+      const o = g.obj;
+      if (o && o.wait === 0) {                        // the ball, 2x2
+        setOn(plane, o.x, FLOOR_Y - 2); setOn(plane, o.x + 1, FLOOR_Y - 2);
+        setOn(plane, o.x, FLOOR_Y - 1); setOn(plane, o.x + 1, FLOOR_Y - 1);
+      }
+      drawNum(plane, g.score, LCD - 1 - numWidth(g.score, 1), 1, 1);
+      for (let m = 0; m < g.misses; m++) {            // miss pips, top-left
+        setOn(plane, 1 + m * 3, 1); setOn(plane, 2 + m * 3, 2);
+        setOn(plane, 2 + m * 3, 1); setOn(plane, 1 + m * 3, 2);
+      }
+      return;
+    }
+    if ((g.t & 3) !== 3)                              // 'over': final score flashes big
+      drawNum(plane, g.score, CENTER_X - (numWidth(g.score, 2) >> 1), 2, 2);
+  }
+
   function drawTrick(plane, ch) {
     const t = TRICKS[ch.trick];
     const ph = clamp(ch.trickDur ? ch.trickT / ch.trickDur : 0, 0, 1);
@@ -966,6 +1119,7 @@
       blitFrame(plane, frameIndex, ch.x, baseY, ch.facing);
       if (ch.emote) blitIcon(plane, ch.emote.icon, ch.x, baseY - 24);
     }
+    if (cube.game) drawGameHud(plane, cube);
   }
 
   // compose a cube's 32x32 LCD plane
@@ -1386,6 +1540,13 @@
 
   function pressButton(cube, i) {
     cube._pressBtn = i; cube._pressT = 150;
+    // in game mode the deck is the controller: 0 quits, 1/2 are inputs
+    if (cube.game) {
+      if (i === 0) { endGame(cube, true); sfx.poke(); return; }
+      if (cube.game.phase === 'play') cube.game.pressed = i;   // judged next tick
+      wakeCube(cube);
+      return;
+    }
     if (i === 2) {                                    // power: sleep toggle
       if (cube.asleep) wakeCube(cube);                // B3: wake plays the power-flash
       else { cube.asleep = true; cube.boot = null; }
@@ -1395,8 +1556,8 @@
     wakeCube(cube);
     // exclude figures mid-doorway (see pokeCube) — hijacking one strands it
     const occ = occupantsOf(cube).filter(c => c.state !== 'transfer' && c.state !== 'entering');
-    if (i === 0) {                                    // play signature game
-      if (occ.length) { const ch = pick(occ); if (TRICKS[ch.trick]) startTrick(ch, cube); }
+    if (i === 0) {                                    // start this cube's game
+      startGame(cube);
     } else if (i === 1) {                              // greet: wave + note emote
       if (occ.length) {
         const ch = pick(occ);
@@ -1472,6 +1633,7 @@
     const sp = Math.hypot(vx, vy);
     drag.shake = drag.shake * 0.85 + sp * 0.15;
     if (drag.shake > 2.2) {
+      if (drag.cube.game) endGame(drag.cube, false);
       for (const ch of drag.cube.occupants.map(cubeById2)) if (ch && ch.dizzy <= 0) { ch.act = null; ch.yOff = 0; ch.dizzy = 9; ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.x = clamp(ch.x, 5, 27); ch.transPhase = null; }
       drag.cube.wiggle = 260;
       if (Math.random() < 0.06) sfx.dizzy();
@@ -1601,6 +1763,16 @@
       if (c.boot && (!finite(c.boot.t) || !finite(c.boot.dur))) fail(`cube ${c.id}: boot timer corrupt`);
       // (g) occupancy cap
       if (c.occupants.length > MAX_OCCUPANTS) fail(`cube ${c.id}: ${c.occupants.length} occupants > ${MAX_OCCUPANTS}`);
+      // live game <-> player linkage
+      if (c.game) {
+        const g = c.game;
+        if (!['countdown', 'play', 'over'].includes(g.phase)) fail(`cube ${c.id}: game phase '${g.phase}'`);
+        for (const k of ['t', 'score', 'misses', 'speed'])
+          if (!finite(g[k])) fail(`cube ${c.id}: game.${k} not finite (${g[k]})`);
+        const p = chars.find(k => k.id === g.charId);
+        if (!p || p.cubeId !== c.id || p.state !== 'gaming')
+          fail(`cube ${c.id}: game player ${g.charId} missing/absent/not gaming`);
+      }
     }
 
     // (b) every character resolves, and occupant lists agree with cubeId
@@ -1621,6 +1793,10 @@
       const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
       if (!Number.isInteger(ch.frame) || ch.frame < 0 || ch.frame >= seq.length)
         fail(`char ${ch.id}: frame ${ch.frame} outside anim '${ch.anim}' (len ${seq.length})`);
+      if (ch.state === 'gaming') {
+        const k = cubeById(ch.cubeId);
+        if (!k || !k.game || k.game.charId !== ch.id) fail(`char ${ch.id}: gaming without a live game`);
+      }
       // (c) position sanity: only mid-portal states may poke past the panel
       // edge; a settled idle figure sits inside the 5..27 lane band.
       if (ch.state !== 'transfer' && ch.state !== 'entering') {
@@ -1660,6 +1836,7 @@
     poke: pokeCube,
     findSnap,
     saveNow: saveWorld,
+    press: pressButton,
     forceTransfer: (charIdx, edge) => { const ch = chars[charIdx]; beginTransfer(ch, cubeById(ch.cubeId), edge); },
     startAct: (charIdx, key) => startAct(chars[charIdx], key),
     planeAscii: (cubeIdx) => {
