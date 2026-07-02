@@ -80,7 +80,7 @@ the game engine and cover the whole roster with our own LCD art.
   (Dodger: ball drops from varying x, press when overhead).
   *Accept: each game playable to ≥5 points via scripted presses; distinct
   props; speed ramps; misses animate.*
-- [ ] **P1.3 Aim/sequence batch** — Fire hose (Sparky: flames pop up at
+- [x] **P1.3 Aim/sequence batch** — Fire hose (Sparky: flames pop up at
   three heights, btn1 cycles aim, btn0 sprays), snake charmer (Dart: the
   snake rises in a 2–4 step button pattern to mimic; wrong = snake ducks),
   rocket hover (Sci-Fi: btn0 thrusts against gravity through scrolling gaps).

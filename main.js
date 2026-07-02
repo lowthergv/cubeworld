@@ -692,7 +692,12 @@
     if (!g) return;
     cube.game = null;
     const ch = chars.find(c => c.id === g.charId);
-    if (ch && ch.state === 'gaming') { ch.state = 'idle'; setAnim(ch, 'idle'); ch.think = irand(4, 10); }
+    if (ch && ch.state === 'gaming') {
+      // a stage mark can sit outside the settled band — walk back into it
+      if (ch.x < 5 || ch.x > 27) { ch.state = 'walking'; ch.target = clamp(Math.round(ch.x), 6, 26); setAnim(ch, 'walk'); }
+      else { ch.state = 'idle'; setAnim(ch, 'idle'); }
+      ch.think = irand(4, 10);
+    }
     if (showScore) {
       const name = (TRICKS[cube.housing.trick] || {}).game || 'GAME';
       cube.toast = { text: `${name} · ${g.score} PTS · BEST ${g.best}`, t: 3600, dur: 3600 };
@@ -715,11 +720,25 @@
     return false;
   }
 
-  // ---- game mechanics (P1.2): each is {init, tick, draw} ------------------
+  // ---- game mechanics (P1.2/P1.3): each is {init, tick, draw} -------------
   // P1.1's generic volley stays the default; real characters map onto their
-  // documented games via GAME_KIND. All motion/judgment is per-tick.
-  const GAME_KIND = { whip: 'rope', slugger: 'bat', dodger: 'header' };
+  // documented games via GAME_KIND. All motion/judgment is per-tick. A
+  // mechanic may set homeX to stage its player off-centre (hose/rocket play
+  // toward the right edge). NOTE: the backlog sketched btn0 as a game input,
+  // but btn0 is the engine's start/quit — game inputs are buttons 1 and 2.
+  const GAME_KIND = {
+    whip: 'rope', slugger: 'bat', dodger: 'header',
+    sparky: 'hose', dart: 'snake', scifi: 'rocket',
+  };
   const HEAD_Y = FLOOR_Y - 20;                        // header strike row
+  const HOSE_ROWS = [9, 16, 23];                      // burning-window rows
+  // a dotted ray from (x0,y0) toward (x1,y1): `span` 0..1 of the distance,
+  // one dot every `step` — the hose nozzle and its water arc
+  function dotted(plane, x0, y0, x1, y1, span, step) {
+    const n = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+    for (let i = 0; i <= n * span; i += step)
+      setOn(plane, x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n);
+  }
   const MECHANICS = {
     // a ball closes in from either side — strike it in the window
     volley: {
@@ -836,6 +855,134 @@
         setOn(plane, o.x, o.y + 1); setOn(plane, o.x + 1, o.y + 1);
       },
     },
+    // Sparky's fire hose: btn1 raises the nozzle a window, btn2 sprays —
+    // douse the burning window before it flares
+    hose: {
+      homeX: 9,
+      init(g) { g.obj = { flame: irand(0, 3), fuseMax: 14, fuse: 14, aim: 0, spray: 0 }; },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj;
+        ch.facing = 1;                                // the fire is stage right
+        if (o.spray > 0) o.spray--;
+        if (pressed === 1) o.aim = (o.aim + 2) % 3;   // cycle upward: 0→2→1→0
+        else if (pressed === 2) {
+          o.spray = 2;
+          if (o.aim === o.flame) {                    // doused it
+            if (gameHit(g, ch, null)) o.fuseMax = Math.max(7, o.fuseMax - 2);
+            o.flame = irand(0, 3); o.fuse = o.fuseMax;
+          } else if (gameMiss(cube, g, ch)) return;   // watered an empty window
+        }
+        if (--o.fuse <= 0) {                          // it flared up
+          if (gameMiss(cube, g, ch)) return;
+          o.flame = irand(0, 3); o.fuse = o.fuseMax;
+        }
+      },
+      draw(plane, g, ch) {
+        const o = g.obj;
+        for (let y = 6; y <= FLOOR_Y; y++) setOn(plane, 25, y);         // building face
+        for (let k = 0; k < 3; k++) {
+          const wy = HOSE_ROWS[k];
+          for (let x = 27; x <= 30; x++) { setOn(plane, x, wy); setOn(plane, x, wy + 4); }
+          for (let y = wy + 1; y < wy + 4; y++) { setOn(plane, 27, y); setOn(plane, 30, y); }
+          if (o.flame === k) {                        // flickering flame
+            setOn(plane, 28 + (g.t & 1), wy + 1);
+            setOn(plane, 28, wy + 3); setOn(plane, 29, wy + 3);
+            setOn(plane, 29 - (g.t & 1), wy + 2);
+          }
+        }
+        // nozzle points at the aimed window; spray throws the full arc
+        dotted(plane, ch.x + 4, FLOOR_Y - 9, 26, HOSE_ROWS[o.aim] + 2, o.spray ? 1 : 0.28, o.spray ? 2 : 1);
+      },
+    },
+    // Dart's snake charmer: watch the snake bob out its low/high pattern,
+    // then echo it back on buttons 1 (low) and 2 (high)
+    snake: {
+      homeX: 10,
+      deal(g) {
+        const o = g.obj;
+        o.seq = Array.from({ length: o.len }, () => irand(1, 3));
+        o.mode = 'show'; o.showT = 0; o.idx = 0; o.head = 0; o.fuse = 25;
+      },
+      init(g) { g.obj = { seq: [], mode: 'show', showT: 0, idx: 0, head: 0, len: 2, fuse: 25 }; MECHANICS.snake.deal(g); },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj;
+        ch.facing = 1;
+        if (o.mode === 'show') {                      // the snake demonstrates
+          const step = Math.floor(o.showT / 4);
+          if (step >= o.seq.length) { o.mode = 'echo'; o.idx = 0; o.head = 0; o.fuse = 25; return; }
+          o.head = o.seq[step];
+          o.showT++;
+          return;
+        }
+        o.head = 0;                                   // echo: you play it back
+        if (pressed) {
+          o.head = pressed;
+          o.fuse = 25;
+          if (pressed === o.seq[o.idx]) {
+            o.idx++;
+            if (o.idx >= o.seq.length) {              // charmed the whole run
+              gameHit(g, ch, 'wave');
+              o.len = Math.min(4, 2 + Math.floor(g.score / 2));
+              MECHANICS.snake.deal(g);
+            }
+          } else {                                    // sour note — it ducks
+            if (gameMiss(cube, g, ch)) return;
+            MECHANICS.snake.deal(g);
+          }
+          return;
+        }
+        if (--o.fuse <= 0) {                          // hesitated too long
+          if (gameMiss(cube, g, ch)) return;
+          MECHANICS.snake.deal(g);
+        }
+      },
+      draw(plane, g, ch) {
+        const o = g.obj;
+        const bx = 25;
+        stamp(plane, ['11111', '01110'], bx - 2, FLOOR_Y - 1);          // basket
+        const h = o.head === 2 ? 15 : o.head === 1 ? 8 : 4;             // rise height
+        for (let y = 0; y < h; y++)
+          setOn(plane, bx + Math.round(Math.sin(y * 0.7) * 1.2), FLOOR_Y - 2 - y);
+        const hx = bx + Math.round(Math.sin((h - 1) * 0.7) * 1.2);      // head
+        setOn(plane, hx + 1, FLOOR_Y - 1 - h); setOn(plane, hx - 1, FLOOR_Y - 1 - h);
+        for (let i = 0; i < o.idx; i++) setOn(plane, bx - 2 + i * 2, FLOOR_Y + 1);   // echo progress
+        if (o.mode === 'echo' && (g.t & 3) < 2) setOn(plane, ch.x + ch.facing * 5, FLOOR_Y - 12);  // your turn
+      },
+    },
+    // Sci-Fi's rocket hover: press either button to thrust; ride the gaps
+    // in the oncoming walls
+    rocket: {
+      homeX: 5,
+      init(g) { g.obj = { ry: 14, wx: LCD + 4, gapY: irand(6, 18), gapH: 9, speed: 1, thrust: 0 }; },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj, rx = 12;
+        ch.facing = 1;
+        if (o.thrust > 0) o.thrust--;
+        if (pressed) { o.ry -= 3; o.thrust = 2; } else o.ry += 1;
+        o.ry = clamp(o.ry, 3, FLOOR_Y - 4);
+        o.wx -= o.speed;
+        if (o.wx <= rx && o.wx > rx - o.speed - 1) {  // the wall reaches the ship
+          const cleared = o.ry >= o.gapY && o.ry + 3 <= o.gapY + o.gapH - 1;
+          if (cleared) {
+            if (gameHit(g, ch, null)) { o.speed = Math.min(2, o.speed + 1); o.gapH = Math.max(7, o.gapH - 1); }
+          } else {
+            if (gameMiss(cube, g, ch)) return;
+            o.ry = 14;
+          }
+          o.wx = LCD + irand(3, 9);
+          o.gapY = irand(4, FLOOR_Y - 3 - o.gapH);
+        }
+      },
+      draw(plane, g, ch) {
+        const o = g.obj;
+        setOn(plane, 17, 4); setOn(plane, 23, 8); setOn(plane, 20, 14); setOn(plane, 28, 3);  // stars
+        stamp(plane, ['010', '111', '111', '101'], 11, Math.round(o.ry));                     // the ship
+        if (o.thrust > 0) { setOn(plane, 12, o.ry + 4); setOn(plane, 12, o.ry + 5); }
+        if (o.wx >= 0 && o.wx < LCD)
+          for (let y = 2; y <= FLOOR_Y; y++)
+            if (y < o.gapY || y >= o.gapY + o.gapH) setOn(plane, o.wx, y);
+      },
+    },
   };
 
   function tickGame(cube) {
@@ -846,10 +993,11 @@
     g.t++;
     const pressed = g.pressed; g.pressed = 0;         // consume the latch
     if (g.phase === 'countdown') {
-      // use the 3-2-1 to walk the player to centre stage
-      if (ch.x !== CENTER_X) {
-        ch.facing = ch.x <= CENTER_X ? 1 : -1;
-        ch.x = towardTick(ch.x, CENTER_X, WALK_DOTS);
+      // use the 3-2-1 to walk the player to its stage mark
+      const hx = MECHANICS[g.kind].homeX || CENTER_X;
+      if (ch.x !== hx) {
+        ch.facing = ch.x <= hx ? 1 : -1;
+        ch.x = towardTick(ch.x, hx, WALK_DOTS);
         setAnim(ch, 'walk');
       } else if (ch.anim === 'walk') setAnim(ch, 'idle');
       if (g.t % 5 === 0 && g.t < GAME_COUNTDOWN) sfx.count();

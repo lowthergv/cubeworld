@@ -5,6 +5,28 @@ verified, cache version after the change. Newest entries at the top.
 
 ---
 
+- **2026-07-02 · P1.3 Aim/sequence batch** — Three mechanics beyond pure
+  timing (note: backlog sketched btn0 as an input, but btn0 is start/quit —
+  games use buttons 1/2): **hose** (Sparky — building face stage right with
+  three windows, a flame flickers in one on a fuse; btn1 cycles the nozzle
+  aim, btn2 sprays a dotted water arc; dousing scores, wrong-window sprays
+  and flare-ups miss; fuse tightens every 3 points), **snake** (Dart —
+  Simon-style: the snake bobs out a low/high pattern from its basket, then
+  you echo it on btn1=low/btn2=high with a per-press hesitation fuse; a
+  full run scores and the pattern grows 2→4; sour notes duck the snake),
+  **rocket** (Sci-Fi — either button thrusts against gravity; ride the gap
+  in each oncoming wall; clears score and speed up/narrow the gap, clips
+  reset the ship). Mechanics now take a `homeX` stage mark (hose 9, snake
+  10, rocket 5) — countdown walks the player there instead of centre — and
+  endGame walks a player back into the settled band if its mark was
+  outside. New `dotted()` ray helper. Verified in-browser (?fresh=1): each
+  game scripted to 5 points with 0 misses via its own policy (aim-then-
+  spray / pattern echo / gap-following), then deliberately lost (wrong
+  windows / sour notes / pinned throttle) through to clean game-over;
+  120-tick soak after; staging marks confirmed; screenshot shows hose on a
+  real Sparky S.E. cube, snake basket, rocket over the jumbo city;
+  selftest green throughout; console clean. Cache: main.js?v=20.
+
 - **2026-07-02 · P1.2 Timing-game batch** — The play phase is now a
   MECHANICS dispatch ({init,tick,draw} per kind); GAME_KIND maps tricks to
   mechanics and P1.1's volley stays the default. Three real games, all our
