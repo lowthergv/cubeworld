@@ -225,23 +225,36 @@
   }
 
   // ---- dissolve: any character not in its home cube snaps back ----
+  // Route a character back to its own cube and reset it to a settled idle.
+  // If the homecoming overfills the cube (its resident returns while four
+  // guests are visiting), guests give way — they dissolve onward to their own
+  // homes. Terminates: every hop settles one more character at home, and a
+  // resident is never evicted from its own cube.
+  function sendHome(ch) {
+    const cur = cubeById(ch.cubeId), home = cubeById(ch.homeId);
+    if (!home) return;
+    if (cur && cur !== home) {
+      const idx = cur.occupants.indexOf(ch.id);
+      if (idx >= 0) cur.occupants.splice(idx, 1);
+    }
+    if (!home.occupants.includes(ch.id)) home.occupants.push(ch.id);
+    ch.cubeId = ch.homeId;
+    ch.state = 'idle'; ch.anim = 'idle'; ch.frame = 0;
+    ch.act = null; ch.oneShot = null; ch.yOff = 0; ch.transPhase = null;
+    ch.x = rand(9, 23);
+    ch.emote = null;
+    while (home.occupants.length > MAX_OCCUPANTS) {
+      const guest = occupantsOf(home).find(o => o.homeId !== home.id);
+      if (!guest) break;
+      sendHome(guest);
+    }
+  }
   function dissolveOrphans() {
     for (const ch of chars) {
       if (ch.cubeId === ch.homeId) continue;
-      const cur = cubeById(ch.cubeId), home = cubeById(ch.homeId);
-      if (!cur || !home) continue;
+      if (!cubeById(ch.cubeId) || !cubeById(ch.homeId)) continue;
       // still reachable through a live connection? if not, dissolve home.
-      if (!pathConnected(ch.cubeId, ch.homeId)) {
-        const idx = cur.occupants.indexOf(ch.id);
-        if (idx >= 0) cur.occupants.splice(idx, 1);
-        if (!home.occupants.includes(ch.id)) home.occupants.push(ch.id);
-        ch.cubeId = ch.homeId;
-        ch.state = 'idle'; ch.anim = 'idle'; ch.frame = 0;
-        ch.act = null; ch.oneShot = null; ch.yOff = 0; ch.transPhase = null;
-        ch.x = rand(9, 23);
-        ch.emote = null;
-        sfx.dissolve();
-      }
+      if (!pathConnected(ch.cubeId, ch.homeId)) { sendHome(ch); sfx.dissolve(); }
     }
   }
   function pathConnected(aId, bId) {
@@ -681,7 +694,9 @@
   function pokeCube(cube) {
     wakeCube(cube);
     cube.wiggle = 320;
-    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer');
+    // a figure mid-doorway (transfer OR entering) can be off the 32-dot panel;
+    // hijacking it into a poke reaction would strand it off-screen.
+    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer' && c.state !== 'entering');
     if (occ.length) {
       const ch = pick(occ);
       // a poke often coaxes out the character's signature trick
@@ -698,7 +713,12 @@
   function shakeAll() {
     ensureAudio();
     for (const cube of cubes) { cube.wiggle = 500; wakeCube(cube); }
-    for (const ch of chars) { ch.act = null; ch.yOff = 0; ch.dizzy = irand(9, 14); ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.emote = null; }
+    for (const ch of chars) {
+      ch.act = null; ch.yOff = 0; ch.dizzy = irand(9, 14); ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.emote = null;
+      // a shake can interrupt a figure mid-portal (x past the panel edge) —
+      // it tumbles back inside rather than staying stranded off-screen.
+      ch.x = clamp(ch.x, 5, 27); ch.transPhase = null;
+    }
     sfx.dizzy();
   }
 
@@ -1300,7 +1320,11 @@
       ];
       for (const t of targets) {
         const d = Math.hypot(tx - t.x, ty - t.y);
-        if (d < SNAP && (!best || d < best.d)) best = { x: t.x, y: t.y, d };
+        if (d >= SNAP || (best && d >= best.d)) continue;
+        // solid plastic: a slot another cube already sits in can't take a
+        // second one (stacked cubes made recomputeConnections asymmetric).
+        const taken = cubes.some(k => k !== cube && Math.abs(k.x - t.x) < TOL && Math.abs(k.y - t.y) < TOL);
+        if (!taken) best = { x: t.x, y: t.y, d };
       }
     }
     return best;
@@ -1332,7 +1356,8 @@
       return;
     }
     wakeCube(cube);
-    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer');
+    // exclude figures mid-doorway (see pokeCube) — hijacking one strands it
+    const occ = occupantsOf(cube).filter(c => c.state !== 'transfer' && c.state !== 'entering');
     if (i === 0) {                                    // play signature game
       if (occ.length) { const ch = pick(occ); if (TRICKS[ch.trick]) startTrick(ch, cube); }
     } else if (i === 1) {                              // greet: wave + note emote
@@ -1362,16 +1387,7 @@
       }
     }
     for (const ch of chars) {
-      if (ch.cubeId === cube.id && ch.homeId !== cube.id) {
-        const oi = cube.occupants.indexOf(ch.id);
-        if (oi >= 0) cube.occupants.splice(oi, 1);
-        const home = cubeById(ch.homeId);
-        if (home && !home.occupants.includes(ch.id)) home.occupants.push(ch.id);
-        ch.cubeId = ch.homeId;
-        ch.state = 'idle'; ch.anim = 'idle'; ch.frame = 0;
-        ch.act = null; ch.oneShot = null; ch.yOff = 0; ch.transPhase = null;
-        ch.x = rand(9, 23); ch.emote = null;
-      }
+      if (ch.cubeId === cube.id && ch.homeId !== cube.id) sendHome(ch);
     }
     const ci = cubes.indexOf(cube);
     if (ci >= 0) cubes.splice(ci, 1);
@@ -1418,7 +1434,7 @@
     const sp = Math.hypot(vx, vy);
     drag.shake = drag.shake * 0.85 + sp * 0.15;
     if (drag.shake > 2.2) {
-      for (const ch of drag.cube.occupants.map(cubeById2)) if (ch && ch.dizzy <= 0) { ch.act = null; ch.yOff = 0; ch.dizzy = 9; ch.state = 'dizzy'; setAnim(ch, 'dizzy'); }
+      for (const ch of drag.cube.occupants.map(cubeById2)) if (ch && ch.dizzy <= 0) { ch.act = null; ch.yOff = 0; ch.dizzy = 9; ch.state = 'dizzy'; setAnim(ch, 'dizzy'); ch.x = clamp(ch.x, 5, 27); ch.transPhase = null; }
       drag.cube.wiggle = 260;
       if (Math.random() < 0.06) sfx.dizzy();
     }
@@ -1503,6 +1519,93 @@
   initWorld();
   requestAnimationFrame(tick);
 
+  // ---- P0.1: in-page invariant selftest -----------------------------------
+  // Side-effect-free (composePlane rewrites cube.plane, which every render
+  // frame redoes anyway). Returns { pass, failures } — run after any change
+  // to prove the simulation is still coherent.
+  function selftest() {
+    const failures = [];
+    const fail = m => failures.push(m);
+    const finite = v => typeof v === 'number' && isFinite(v);
+    const EDGES = ['top', 'bottom', 'left', 'right'];
+
+    const cubeIds = new Set();
+    for (const c of cubes) { if (cubeIds.has(c.id)) fail(`duplicate cube id ${c.id}`); cubeIds.add(c.id); }
+
+    for (const c of cubes) {
+      // (a) connections are symmetric and the seam really is flush
+      for (const edge of EDGES) {
+        const nId = c.conn[edge];
+        if (nId == null) continue;
+        const n = cubeById(nId);
+        if (!n) { fail(`cube ${c.id}: conn.${edge} -> missing cube ${nId}`); continue; }
+        if (n.conn[OPPOSITE[edge]] !== c.id) fail(`cube ${c.id}: conn.${edge}=${nId} not mirrored back`);
+        const gap = edge === 'right' ? n.x - (c.x + CUBE_SIZE)
+                  : edge === 'left' ? c.x - (n.x + CUBE_SIZE)
+                  : edge === 'bottom' ? n.y - (c.y + CUBE_SIZE)
+                  : c.y - (n.y + CUBE_SIZE);
+        const lap = (edge === 'left' || edge === 'right')
+          ? overlap(c.y, c.y + CUBE_SIZE, n.y, n.y + CUBE_SIZE)
+          : overlap(c.x, c.x + CUBE_SIZE, n.x, n.x + CUBE_SIZE);
+        if (Math.abs(gap) >= TOL) fail(`cube ${c.id}: ${edge} seam not flush (gap ${gap.toFixed(2)})`);
+        if (lap < CUBE_SIZE * 0.85) fail(`cube ${c.id}: ${edge} seam under-lapped (${Math.round(lap)}px)`);
+      }
+      // (d) cube numerics; (f) door and blind ranges
+      for (const k of ['x', 'y', 'wiggle', 'idle', 'connFlash', 'tickT', 'ticks', 'blind'])
+        if (!finite(c[k])) fail(`cube ${c.id}.${k} not finite (${c[k]})`);
+      for (const edge of EDGES) {
+        const d = c.door[edge];
+        if (!Number.isInteger(d) || d < 0 || d > DOOR_STEPS) fail(`cube ${c.id}: door.${edge}=${d} outside 0..${DOOR_STEPS}`);
+      }
+      if (!Number.isInteger(c.blind) || c.blind < 0 || c.blind > LCD) fail(`cube ${c.id}: blind=${c.blind} outside 0..${LCD}`);
+      if (c.boot && (!finite(c.boot.t) || !finite(c.boot.dur))) fail(`cube ${c.id}: boot timer corrupt`);
+      // (g) occupancy cap
+      if (c.occupants.length > MAX_OCCUPANTS) fail(`cube ${c.id}: ${c.occupants.length} occupants > ${MAX_OCCUPANTS}`);
+    }
+
+    // (b) every character resolves, and occupant lists agree with cubeId
+    const seat = new Map();                    // char id -> cube id it's seated in
+    for (const c of cubes)
+      for (const id of c.occupants) {
+        if (seat.has(id)) fail(`char ${id} listed in cubes ${seat.get(id)} and ${c.id}`);
+        seat.set(id, c.id);
+      }
+    for (const ch of chars) {
+      if (!cubeById(ch.homeId)) fail(`char ${ch.id}: homeId ${ch.homeId} missing`);
+      if (!cubeById(ch.cubeId)) fail(`char ${ch.id}: cubeId ${ch.cubeId} missing`);
+      if (seat.get(ch.id) !== ch.cubeId) fail(`char ${ch.id}: cubeId=${ch.cubeId} but seated in ${seat.get(ch.id)}`);
+      seat.delete(ch.id);
+      for (const k of ['x', 'yOff', 'frame', 'think', 'dizzy', 'trickT', 'trickDur'])
+        if (!finite(ch[k])) fail(`char ${ch.id}.${k} not finite (${ch[k]})`);
+      if (ch.facing !== 1 && ch.facing !== -1) fail(`char ${ch.id}: facing=${ch.facing}`);
+      const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
+      if (!Number.isInteger(ch.frame) || ch.frame < 0 || ch.frame >= seq.length)
+        fail(`char ${ch.id}: frame ${ch.frame} outside anim '${ch.anim}' (len ${seq.length})`);
+      // (c) position sanity: only mid-portal states may poke past the panel
+      // edge; a settled idle figure sits inside the 5..27 lane band.
+      if (ch.state !== 'transfer' && ch.state !== 'entering') {
+        if (ch.x < -1 || ch.x > LCD) fail(`char ${ch.id}: x=${ch.x} off-screen in state '${ch.state}'`);
+        if (ch.state === 'idle' && ch.anim !== 'walk' && (ch.x < 4.5 || ch.x > 27.5))
+          fail(`char ${ch.id}: settled at x=${ch.x} outside the 5..27 band`);
+        if (ch.yOff !== 0) fail(`char ${ch.id}: yOff=${ch.yOff} while grounded in state '${ch.state}'`);
+      } else {
+        if (ch.x < -8 || ch.x > LCD + 8) fail(`char ${ch.id}: x=${ch.x} beyond portal reach`);
+        if (ch.yOff < -24 || ch.yOff > 16) fail(`char ${ch.id}: yOff=${ch.yOff} outside hatch travel`);
+      }
+    }
+    for (const id of seat.keys()) fail(`cube occupant ${id} has no character`);
+
+    // (e) plane composition is deterministic within a tick
+    for (const c of cubes) {
+      const a = composePlane(c).slice();
+      const b = composePlane(c);
+      for (let i = 0; i < a.length; i++)
+        if (a[i] !== b[i]) { fail(`cube ${c.id}: plane differs between same-tick composes`); break; }
+    }
+
+    return { pass: failures.length === 0, failures };
+  }
+
   // debug hook
   window.__cw = { cubes, chars, CSS_W: () => CSS_W, CSS_H: () => CSS_H,
     // advance every cube by exactly n LCD ticks, deterministically — calls
@@ -1510,6 +1613,12 @@
     // accumulator so tests don't depend on wall-clock frame timing.
     ff: n => { for (let i = 0; i < n; i++) for (const cube of cubes) { cube.ticks++; tickCube(cube); } },
     recompute: recomputeConnections,
+    selftest,
+    dissolve: dissolveOrphans,
+    shakeAll,
+    addCube,
+    poke: pokeCube,
+    findSnap,
     forceTransfer: (charIdx, edge) => { const ch = chars[charIdx]; beginTransfer(ch, cubeById(ch.cubeId), edge); },
     startAct: (charIdx, key) => startAct(chars[charIdx], key),
     planeAscii: (cubeIdx) => {

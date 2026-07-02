@@ -41,7 +41,7 @@ unchecked item, implement it completely, verify it, log it, commit it.
 
 ## Phase 0 — Loop infrastructure
 
-- [ ] **P0.1 In-page selftest** — Add `__cw.selftest()` to main.js: returns
+- [x] **P0.1 In-page selftest** — Add `__cw.selftest()` to main.js: returns
   `{ pass, failures: [] }` checking (a) connections are symmetric and edges
   flush, (b) every character's `home`/current cube ids resolve, (c) every
   figure x within lane bounds 5..27 when settled, (d) no NaN/undefined in any
@@ -56,7 +56,7 @@ unchecked item, implement it completely, verify it, log it, commit it.
   *Accept: reload restores the same layout + characters; `?fresh=1` gives a
   new random world; Reset then reload gives a new world; selftest passes
   after restore.*
-- [ ] **P0.3 Devlog seeded** — DEVLOG.md exists and the loop appends to it
+- [x] **P0.3 Devlog seeded** — DEVLOG.md exists and the loop appends to it
   every iteration (this item is done when the first real entry lands).
 
 ## Phase 1 — Playable mini-games (flagship)
