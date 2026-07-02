@@ -5,6 +5,25 @@ verified, cache version after the change. Newest entries at the top.
 
 ---
 
+- **2026-07-02 · P1.5 Full roster coverage — PHASE 1 COMPLETE** — GAME_SKIN
+  maps all 22 documented games onto the six mechanics with their own props:
+  volley family (Scoop catches his dog, Slim/Dash/Grinder/Block Bash hop
+  their alien/dog/ledge/taxi with a bob, Hans/Chief karate-chop blocks and
+  doors, Dusty swats a buzzing fly, Kicks strikes the ball), header family
+  (Slam dunks, Mic catches falling notes, Toner catches paperwork), hose
+  reskinned as Handy's whack-a-mole (three burrows, mole pops, hammer
+  hovers over the aim and WHACKs), snake reskinned as Hip Hop's boombox
+  echo, rocket reskinned as Splash's underwater run (surface chop, bubbles,
+  sub) and Global's cloud-hopping chopper. Authenticity call: the game now
+  belongs to the CUBE (icon is molded into the deck) — kind derives from
+  cube.housing.trick, so a visitor plays the host cabinet's game; best
+  scores were already cabinet-keyed (P1.4). Verified in-browser (?fresh=1):
+  swept ALL 31 roster units (incl. SE + Ban Dai JP variants) through
+  enter→score≥1→quit with per-kind policies — zero failures, kind spread
+  volley 12 / header 6 / hose 4 / rocket 4 / bat 2 / snake 2 / rope 1;
+  skins screenshotted (moles, boombox, sea, alien-hop); selftest green
+  after every unit; console clean. Cache: main.js?v=22.
+
 - **2026-07-02 · P1.4 High scores persisted** — Best scores now live in
   localStorage `cw_best_v1`, keyed by the CUBE's roster index (the cabinet
   remembers its game's record, arcade-style; SE/JP variants keep their own).

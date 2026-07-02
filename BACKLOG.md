@@ -88,7 +88,7 @@ the game engine and cover the whole roster with our own LCD art.
 - [x] **P1.4 High scores** — Per-character best score persisted with P0.2
   storage; shown on the game-over toast and in the album (P3.1) later.
   *Accept: beat a score, reload, best survives.*
-- [ ] **P1.5 Full roster coverage** — Map every remaining roster character to
+- [x] **P1.5 Full roster coverage** — Map every remaining roster character to
   the nearest primitive (timing / aim / sequence / hover) with its own prop
   set from its documented game, so every character is playable.
   *Accept: iterate the whole ROSTER in a script: every char enters game mode

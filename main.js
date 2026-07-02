@@ -699,9 +699,10 @@
     ch.state = 'gaming';
     setAnim(ch, 'idle');
     const rosterIdx = ROSTER.indexOf(cube.housing);   // the cabinet keeps the record
+    const skin = GAME_SKIN[cube.housing.trick] || {};
     cube.game = {
       charId: ch.id, phase: 'countdown', t: 0,
-      kind: GAME_KIND[ch.trick] || 'volley',
+      kind: skin.kind || 'volley', skin,
       score: 0, misses: 0, speed: 1, pressed: 0, bob: 0,
       best: bestScores.get(rosterIdx) || 0, rosterIdx,
       obj: null,
@@ -742,15 +743,38 @@
     return false;
   }
 
-  // ---- game mechanics (P1.2/P1.3): each is {init, tick, draw} -------------
-  // P1.1's generic volley stays the default; real characters map onto their
-  // documented games via GAME_KIND. All motion/judgment is per-tick. A
-  // mechanic may set homeX to stage its player off-centre (hose/rocket play
-  // toward the right edge). NOTE: the backlog sketched btn0 as a game input,
-  // but btn0 is the engine's start/quit — game inputs are buttons 1 and 2.
-  const GAME_KIND = {
-    whip: 'rope', slugger: 'bat', dodger: 'header',
-    sparky: 'hose', dart: 'snake', scifi: 'rocket',
+  // ---- game mechanics (P1.2/P1.3/P1.5): each is {init, tick, draw} --------
+  // The game belongs to the CUBE (its icon is molded into the deck), so the
+  // mechanic is chosen by cube.housing.trick — a visitor on a foreign cube
+  // plays the host cabinet's game. GAME_SKIN maps every documented game onto
+  // a mechanic plus its prop set: `prop` picks the volley/header projectile,
+  // `pose`/`bob` shape the hit reaction (pose:null = hop-only), `skin`
+  // reskins hose/snake/rocket scenery. A mechanic may set homeX to stage its
+  // player off-centre. NOTE: the backlog sketched btn0 as a game input, but
+  // btn0 is the engine's start/quit — game inputs are buttons 1 and 2.
+  const GAME_SKIN = {
+    whip:    { kind: 'rope' },                                        // Skipping
+    slugger: { kind: 'bat' },                                         // Hit That Ball
+    dodger:  { kind: 'header' },                                      // Headers Keep 'Em Up
+    slam:    { kind: 'header' },                                      // Slam Dunk
+    mic:     { kind: 'header', prop: 'note' },                        // Catch The Music
+    toner:   { kind: 'header', prop: 'paper' },                       // Catch The Paperwork
+    sparky:  { kind: 'hose' },                                        // Hose That Fire
+    handy:   { kind: 'hose', skin: 'moles' },                         // Hammer The Mole
+    dart:    { kind: 'snake' },                                       // Snake Charmer
+    hiphop:  { kind: 'snake', skin: 'notes' },                        // Face The Music
+    scifi:   { kind: 'rocket' },                                      // Journey Into Space
+    splash:  { kind: 'rocket', skin: 'sea' },                         // Underwater Adventure
+    global:  { kind: 'rocket', skin: 'sky' },                         // Around The World
+    scoop:   { kind: 'volley', prop: 'dog', pose: 'bend' },           // Dog Catch
+    dash:    { kind: 'volley', prop: 'dog', pose: null, bob: 3 },     // Dog-Bite Delivery
+    slim:    { kind: 'volley', prop: 'alien', pose: null, bob: 3 },   // Jump Over The Alien
+    hans:    { kind: 'volley', prop: 'block', pose: 'mad' },          // Break-Wall Karate
+    grinder: { kind: 'volley', prop: 'block', pose: null, bob: 3 },   // Skateboard Stunts
+    chief:   { kind: 'volley', prop: 'door', pose: 'mad' },           // Door Breaker
+    dusty:   { kind: 'volley', prop: 'fly', pose: 'mad' },            // Fly-Killer Fury
+    kicks:   { kind: 'volley', pose: 'bend' },                        // Penalty Shootout
+    blockbash: { kind: 'volley', prop: 'taxi', pose: null, bob: 3 },  // City Taxi
   };
   const HEAD_Y = FLOOR_Y - 20;                        // header strike row
   const HOSE_ROWS = [9, 16, 23];                      // burning-window rows
@@ -769,7 +793,9 @@
         const o = g.obj;
         if (pressed) {
           if (o.wait === 0 && Math.abs(o.x - ch.x) <= GAME_WINDOW) {
-            if (gameHit(g, ch, 'mad')) g.speed = Math.min(3, g.speed + 1);
+            const pose = g.skin.pose === undefined ? 'mad' : g.skin.pose;
+            if (gameHit(g, ch, pose)) g.speed = Math.min(3, g.speed + 1);
+            if (g.skin.bob) g.bob = g.skin.bob;       // hop-over games jump
             o.wait = irand(5, 9);
           } else if (gameMiss(cube, g, ch)) return;
         }
@@ -782,11 +808,20 @@
           if (over) return;
         }
       },
-      draw(plane, g) {
+      draw(plane, g, ch) {
         const o = g.obj;
         if (o.wait) return;
-        setOn(plane, o.x, FLOOR_Y - 2); setOn(plane, o.x + 1, FLOOR_Y - 2);
-        setOn(plane, o.x, FLOOR_Y - 1); setOn(plane, o.x + 1, FLOOR_Y - 1);
+        const key = g.skin.prop || 'ball';
+        if (key === 'ball') {
+          setOn(plane, o.x, FLOOR_Y - 2); setOn(plane, o.x + 1, FLOOR_Y - 2);
+          setOn(plane, o.x, FLOOR_Y - 1); setOn(plane, o.x + 1, FLOOR_Y - 1);
+        } else if (key === 'fly') {                   // buzzes at swat height
+          const fy = FLOOR_Y - 8 + (g.t & 1) * 2;
+          setOn(plane, o.x, fy); setOn(plane, o.x + 1, fy);
+        } else {                                      // walks/slides in along the floor
+          const bmp = PROP_BMP[key];
+          stamp(plane, bmp, o.x - (bmp[0].length >> 1), FLOOR_Y - bmp.length + 1);
+        }
       },
     },
     // Whip's skipping rope: one sweep per cycle, hop as it reaches your feet
@@ -873,8 +908,13 @@
       draw(plane, g) {
         const o = g.obj;
         if (o.wait) return;
-        setOn(plane, o.x, o.y); setOn(plane, o.x + 1, o.y);
-        setOn(plane, o.x, o.y + 1); setOn(plane, o.x + 1, o.y + 1);
+        const key = g.skin.prop || 'ball';
+        if (key === 'note') stamp(plane, EMOTES.note, o.x - 2, o.y);
+        else if (key === 'paper') stamp(plane, PROP_BMP.paper, o.x - 1, o.y);
+        else {
+          setOn(plane, o.x, o.y); setOn(plane, o.x + 1, o.y);
+          setOn(plane, o.x, o.y + 1); setOn(plane, o.x + 1, o.y + 1);
+        }
       },
     },
     // Sparky's fire hose: btn1 raises the nozzle a window, btn2 sprays —
@@ -901,6 +941,17 @@
       },
       draw(plane, g, ch) {
         const o = g.obj;
+        if (g.skin.skin === 'moles') {                // Handy: three burrows, one mole
+          const xs = [21, 25, 29];
+          for (let k = 0; k < 3; k++) {
+            const x = xs[k];
+            setOn(plane, x - 1, FLOOR_Y + 1); setOn(plane, x, FLOOR_Y + 1); setOn(plane, x + 1, FLOOR_Y + 1);
+            if (o.flame === k) stamp(plane, PROP_BMP.mole, x - 2, FLOOR_Y - 3);
+            if (o.aim === k) setOn(plane, x, FLOOR_Y - 7);              // hammer hovers here
+          }
+          if (o.spray) stamp(plane, ['111', '111'], xs[o.aim] - 1, FLOOR_Y - 6 + (2 - o.spray) * 2);  // WHACK
+          return;
+        }
         for (let y = 6; y <= FLOOR_Y; y++) setOn(plane, 25, y);         // building face
         for (let k = 0; k < 3; k++) {
           const wy = HOSE_ROWS[k];
@@ -961,6 +1012,13 @@
       draw(plane, g, ch) {
         const o = g.obj;
         const bx = 25;
+        if (g.skin.skin === 'notes') {                // Hip Hop: echo the boombox
+          stamp(plane, ['11111', '10101', '11111'], bx - 2, FLOOR_Y - 2);
+          if (o.head) stamp(plane, EMOTES.note, bx - 2, o.head === 2 ? FLOOR_Y - 17 : FLOOR_Y - 10);
+          for (let i = 0; i < o.idx; i++) setOn(plane, bx - 2 + i * 2, FLOOR_Y + 1);
+          if (o.mode === 'echo' && (g.t & 3) < 2) setOn(plane, ch.x + ch.facing * 5, FLOOR_Y - 12);
+          return;
+        }
         stamp(plane, ['11111', '01110'], bx - 2, FLOOR_Y - 1);          // basket
         const h = o.head === 2 ? 15 : o.head === 1 ? 8 : 4;             // rise height
         for (let y = 0; y < h; y++)
@@ -997,8 +1055,20 @@
       },
       draw(plane, g, ch) {
         const o = g.obj;
-        setOn(plane, 17, 4); setOn(plane, 23, 8); setOn(plane, 20, 14); setOn(plane, 28, 3);  // stars
-        stamp(plane, ['010', '111', '111', '101'], 11, Math.round(o.ry));                     // the ship
+        const world = g.skin.skin || 'space';
+        if (world === 'sea') {                        // Splash: bubbles + surface chop
+          for (let x = 1; x < LCD; x += 3) setOn(plane, x, 1);
+          setOn(plane, 18, 6); setOn(plane, 24, 12); setOn(plane, 21, 18);
+          stamp(plane, ['0110', '1111', '0110'], 11, Math.round(o.ry));       // the sub
+        } else if (world === 'sky') {                 // Global: clouds
+          setOn(plane, 17, 4); setOn(plane, 18, 4); setOn(plane, 19, 4);
+          setOn(plane, 25, 9); setOn(plane, 26, 9);
+          setOn(plane, 20, 15); setOn(plane, 21, 15); setOn(plane, 22, 15);
+          stamp(plane, ['1111', '0110', '1111', '0010'], 11, Math.round(o.ry)); // the chopper
+        } else {
+          setOn(plane, 17, 4); setOn(plane, 23, 8); setOn(plane, 20, 14); setOn(plane, 28, 3);  // stars
+          stamp(plane, ['010', '111', '111', '101'], 11, Math.round(o.ry));   // the rocket
+        }
         if (o.thrust > 0) { setOn(plane, 12, o.ry + 4); setOn(plane, 12, o.ry + 5); }
         if (o.wx >= 0 && o.wx < LCD)
           for (let y = 2; y <= FLOOR_Y; y++)
