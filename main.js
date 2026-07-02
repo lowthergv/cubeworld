@@ -329,6 +329,28 @@
     if (saveT) { clearTimeout(saveT); saveT = null; }
     try { localStorage.removeItem(SAVE_KEY); } catch (e) {}
   }
+  // High scores live under their own key: they are collection records, so a
+  // sandbox Reset does NOT clear them (the P3.1 album reads them later).
+  // Keyed by roster index of the CUBE (the cabinet remembers its game).
+  const BEST_KEY = 'cw_best_v1';
+  function saveBests() {
+    if (FRESH) return;                                // clean room writes nothing
+    try {
+      const o = {};
+      for (const [k, v] of bestScores) o[k] = v;
+      localStorage.setItem(BEST_KEY, JSON.stringify(o));
+    } catch (e) {}
+  }
+  function loadBests() {
+    try {
+      const o = JSON.parse(localStorage.getItem(BEST_KEY));
+      if (!o || typeof o !== 'object') return;
+      for (const k of Object.keys(o)) {
+        const idx = +k, v = o[k];
+        if (ROSTER[idx] && Number.isInteger(v) && v > 0 && v <= 99) bestScores.set(idx, v);
+      }
+    } catch (e) {}
+  }
   // rebuild the sandbox from a save; false = no/invalid save, caller inits fresh
   function loadWorld() {
     if (FRESH) return false;
@@ -676,7 +698,7 @@
     ch.act = null; ch.oneShot = null; ch.emote = null;
     ch.state = 'gaming';
     setAnim(ch, 'idle');
-    const rosterIdx = ROSTER.indexOf(ch.ident);
+    const rosterIdx = ROSTER.indexOf(cube.housing);   // the cabinet keeps the record
     cube.game = {
       charId: ch.id, phase: 'countdown', t: 0,
       kind: GAME_KIND[ch.trick] || 'volley',
@@ -706,7 +728,7 @@
   // one strike landed; true = the pace should ramp (every 3rd point)
   function gameHit(g, ch, anim) {
     g.score = Math.min(99, g.score + 1);
-    if (g.score > g.best) { g.best = g.score; bestScores.set(g.rosterIdx, g.best); }
+    if (g.score > g.best) { g.best = g.score; bestScores.set(g.rosterIdx, g.best); saveBests(); }
     if (anim) setAnim(ch, anim, true);
     sfx.hit();
     return g.score % 3 === 0;
@@ -1974,6 +1996,7 @@
   }
 
   resize();
+  loadBests();
   if (!loadWorld()) initWorld();
   resize();           // grow the canvas to fit a restored layout
   requestAnimationFrame(tick);
@@ -2095,6 +2118,7 @@
     findSnap,
     saveNow: saveWorld,
     press: pressButton,
+    bests: bestScores,
     forceTransfer: (charIdx, edge) => { const ch = chars[charIdx]; beginTransfer(ch, cubeById(ch.cubeId), edge); },
     startAct: (charIdx, key) => startAct(chars[charIdx], key),
     planeAscii: (cubeIdx) => {

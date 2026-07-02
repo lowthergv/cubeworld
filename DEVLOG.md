@@ -5,6 +5,17 @@ verified, cache version after the change. Newest entries at the top.
 
 ---
 
+- **2026-07-02 · P1.4 High scores persisted** — Best scores now live in
+  localStorage `cw_best_v1`, keyed by the CUBE's roster index (the cabinet
+  remembers its game's record, arcade-style; SE/JP variants keep their own).
+  Saved immediately on every new best; loaded at boot; deliberately NOT
+  cleared by Reset (they're collection records for the P3.1 album), and the
+  ?fresh=1 clean room never writes them. `__cw.bests` exposes the map.
+  Verified in normal mode: scored 2 on a cabinet, key present with the
+  right index, reload → `bests` map loaded and the next game on that
+  cabinet opens with best=2, Reset leaves the record intact; selftest
+  green; console clean. Cache: main.js?v=21.
+
 - **2026-07-02 · P1.3 Aim/sequence batch** — Three mechanics beyond pure
   timing (note: backlog sketched btn0 as an input, but btn0 is start/quit —
   games use buttons 1/2): **hose** (Sparky — building face stage right with

@@ -85,7 +85,7 @@ the game engine and cover the whole roster with our own LCD art.
   snake rises in a 2–4 step button pattern to mimic; wrong = snake ducks),
   rocket hover (Sci-Fi: btn0 thrusts against gravity through scrolling gaps).
   *Accept: each playable and losable via scripted inputs; selftest passes.*
-- [ ] **P1.4 High scores** — Per-character best score persisted with P0.2
+- [x] **P1.4 High scores** — Per-character best score persisted with P0.2
   storage; shown on the game-over toast and in the album (P3.1) later.
   *Accept: beat a score, reload, best survives.*
 - [ ] **P1.5 Full roster coverage** — Map every remaining roster character to
