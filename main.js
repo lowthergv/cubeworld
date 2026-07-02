@@ -679,7 +679,8 @@
     const rosterIdx = ROSTER.indexOf(ch.ident);
     cube.game = {
       charId: ch.id, phase: 'countdown', t: 0,
-      score: 0, misses: 0, speed: 1, pressed: 0,
+      kind: GAME_KIND[ch.trick] || 'volley',
+      score: 0, misses: 0, speed: 1, pressed: 0, bob: 0,
       best: bestScores.get(rosterIdx) || 0, rosterIdx,
       obj: null,
     };
@@ -697,9 +698,13 @@
       cube.toast = { text: `${name} · ${g.score} PTS · BEST ${g.best}`, t: 3600, dur: 3600 };
     }
   }
-  function spawnObj(g) {
-    const fromLeft = Math.random() < 0.5;
-    g.obj = { x: fromLeft ? 1 : LCD - 2, dir: fromLeft ? 1 : -1, wait: 0 };
+  // one strike landed; true = the pace should ramp (every 3rd point)
+  function gameHit(g, ch, anim) {
+    g.score = Math.min(99, g.score + 1);
+    if (g.score > g.best) { g.best = g.score; bestScores.set(g.rosterIdx, g.best); }
+    if (anim) setAnim(ch, anim, true);
+    sfx.hit();
+    return g.score % 3 === 0;
   }
   // one strike missed; true = that was the third, game over
   function gameMiss(cube, g, ch) {
@@ -709,6 +714,130 @@
     if (g.misses >= GAME_MISSES) { g.phase = 'over'; g.t = 0; sfx.over(); return true; }
     return false;
   }
+
+  // ---- game mechanics (P1.2): each is {init, tick, draw} ------------------
+  // P1.1's generic volley stays the default; real characters map onto their
+  // documented games via GAME_KIND. All motion/judgment is per-tick.
+  const GAME_KIND = { whip: 'rope', slugger: 'bat', dodger: 'header' };
+  const HEAD_Y = FLOOR_Y - 20;                        // header strike row
+  const MECHANICS = {
+    // a ball closes in from either side — strike it in the window
+    volley: {
+      init(g) { const L = Math.random() < 0.5; g.obj = { x: L ? 1 : LCD - 2, dir: L ? 1 : -1, wait: 0 }; },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj;
+        if (pressed) {
+          if (o.wait === 0 && Math.abs(o.x - ch.x) <= GAME_WINDOW) {
+            if (gameHit(g, ch, 'mad')) g.speed = Math.min(3, g.speed + 1);
+            o.wait = irand(5, 9);
+          } else if (gameMiss(cube, g, ch)) return;
+        }
+        if (o.wait > 0) { if (--o.wait === 0) MECHANICS.volley.init(g); return; }
+        o.x += o.dir * g.speed;
+        ch.facing = o.x >= ch.x ? 1 : -1;
+        if ((o.dir > 0 && o.x > ch.x + GAME_WINDOW) || (o.dir < 0 && o.x < ch.x - GAME_WINDOW)) {
+          const over = gameMiss(cube, g, ch);
+          o.wait = irand(4, 8);
+          if (over) return;
+        }
+      },
+      draw(plane, g) {
+        const o = g.obj;
+        if (o.wait) return;
+        setOn(plane, o.x, FLOOR_Y - 2); setOn(plane, o.x + 1, FLOOR_Y - 2);
+        setOn(plane, o.x, FLOOR_Y - 1); setOn(plane, o.x + 1, FLOOR_Y - 1);
+      },
+    },
+    // Whip's skipping rope: one sweep per cycle, hop as it reaches your feet
+    rope: {
+      init(g) { g.obj = { L: 14, p: 0 }; },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj;
+        o.p++;
+        const atFeet = o.p >= o.L;
+        if (pressed) {
+          if (o.p >= o.L - 1) {                       // timed hop
+            if (gameHit(g, ch, null)) o.L = Math.max(7, o.L - 2);
+            g.bob = 3; o.p = 0;
+          } else if (gameMiss(cube, g, ch)) return;   // jumped too early, tangled
+        } else if (atFeet) {
+          if (gameMiss(cube, g, ch)) return;          // rope caught your ankles
+          o.p = 0;
+        }
+      },
+      draw(plane, g, ch) {
+        const o = g.obj;
+        const h = Math.sin(Math.PI * o.p / o.L) * 19;  // 0 at feet, 19 overhead
+        for (let i = -7; i <= 7; i++) {
+          const t = i / 7, a = Math.sqrt(Math.max(0, 1 - t * t));
+          if (h < 3) setOn(plane, ch.x + i, FLOOR_Y + 1 - a * 2);       // skimming the floor
+          else setOn(plane, ch.x + i, FLOOR_Y - h * a);
+        }
+        setOn(plane, ch.x - 6, FLOOR_Y - 10); setOn(plane, ch.x + 6, FLOOR_Y - 10);  // handles
+      },
+    },
+    // Slugger's batting: a pitch flies in, swing to send it flying
+    bat: {
+      init(g) { const L = Math.random() < 0.5; g.obj = { x: L ? 1 : LCD - 2, dir: L ? 1 : -1, wait: 0, fly: 0, fx: 0, fy: 0, swing: 0 }; },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj;
+        if (o.swing > 0) o.swing--;
+        if (o.fly > 0) { o.fly--; o.fx += o.fdir * 3; o.fy -= 2; }
+        if (pressed) {
+          o.swing = 2;
+          if (o.wait === 0 && Math.abs(o.x - ch.x) <= GAME_WINDOW) {   // CRACK
+            if (gameHit(g, ch, 'mad')) g.speed = Math.min(3, g.speed + 1);
+            o.fly = 5; o.fx = o.x; o.fy = FLOOR_Y - 8; o.fdir = -o.dir;
+            o.wait = irand(6, 10);
+          } else if (gameMiss(cube, g, ch)) return;   // swung at air
+        }
+        if (o.wait > 0) { if (--o.wait === 0) { const L = Math.random() < 0.5; o.x = L ? 1 : LCD - 2; o.dir = L ? 1 : -1; } return; }
+        o.x += o.dir * g.speed;
+        ch.facing = o.x >= ch.x ? 1 : -1;
+        if ((o.dir > 0 && o.x > ch.x + GAME_WINDOW) || (o.dir < 0 && o.x < ch.x - GAME_WINDOW)) {
+          const over = gameMiss(cube, g, ch);         // strike!
+          o.wait = irand(5, 9);
+          if (over) return;
+        }
+      },
+      draw(plane, g, ch) {
+        const o = g.obj;
+        if (o.wait === 0) { setOn(plane, o.x, FLOOR_Y - 7); setOn(plane, o.x + 1, FLOOR_Y - 7); setOn(plane, o.x, FLOOR_Y - 8); }  // the pitch
+        if (o.fly > 0) { setOn(plane, o.fx, o.fy); setOn(plane, o.fx + 1, o.fy - 1); }   // it's outta here
+        const bx = ch.x + ch.facing * 3, by = FLOOR_Y - 11;
+        if (o.swing > 0) for (let r = 0; r < 6; r++) setOn(plane, bx + ch.facing * r, by + 2 + (r >> 1));  // swung level
+        else for (let r = 0; r < 6; r++) setOn(plane, bx + ch.facing * (r >> 1), by - r + 2);              // bat held up
+      },
+    },
+    // Dodger's headers: the ball drops — nod it back up at head height
+    header: {
+      init(g, ch) { g.obj = { x: clamp(ch.x + irand(-1, 2), 3, LCD - 3), y: 2, wait: 0 }; },
+      tick(cube, g, ch, pressed) {
+        const o = g.obj;
+        if (pressed) {
+          if (o.wait === 0 && o.y >= HEAD_Y - 2 && o.y <= HEAD_Y + 1) {   // nodded it up
+            gameHit(g, ch, null);
+            g.bob = 2;
+            o.wait = irand(5, 9);
+          } else if (gameMiss(cube, g, ch)) return;
+        }
+        if (o.wait > 0) { if (--o.wait === 0) MECHANICS.header.init(g, ch); return; }
+        o.y += Math.min(3, 1 + Math.floor(g.score / 3));   // falls faster as you score
+        if (o.y >= FLOOR_Y - 1) {
+          const over = gameMiss(cube, g, ch);         // it hit the deck
+          o.wait = irand(5, 9);
+          if (over) return;
+        }
+      },
+      draw(plane, g) {
+        const o = g.obj;
+        if (o.wait) return;
+        setOn(plane, o.x, o.y); setOn(plane, o.x + 1, o.y);
+        setOn(plane, o.x, o.y + 1); setOn(plane, o.x + 1, o.y + 1);
+      },
+    },
+  };
+
   function tickGame(cube) {
     const g = cube.game;
     if (!g) return;
@@ -724,30 +853,13 @@
         setAnim(ch, 'walk');
       } else if (ch.anim === 'walk') setAnim(ch, 'idle');
       if (g.t % 5 === 0 && g.t < GAME_COUNTDOWN) sfx.count();
-      if (g.t >= GAME_COUNTDOWN) { g.phase = 'play'; g.t = 0; spawnObj(g); }
+      if (g.t >= GAME_COUNTDOWN) { g.phase = 'play'; g.t = 0; MECHANICS[g.kind].init(g, ch); }
       return;
     }
     if (g.phase === 'play') {
       if (!ch.oneShot && ch.anim !== 'idle') setAnim(ch, 'idle');   // pose finished
-      const o = g.obj;
-      if (pressed) {
-        if (o.wait === 0 && Math.abs(o.x - ch.x) <= GAME_WINDOW) {  // HIT
-          g.score = Math.min(99, g.score + 1);
-          if (g.score > g.best) { g.best = g.score; bestScores.set(g.rosterIdx, g.best); }
-          if (g.score % 3 === 0) g.speed = Math.min(3, g.speed + 1);
-          o.wait = irand(5, 9);                       // ball is away; respawn soon
-          setAnim(ch, 'mad', true);                   // strike pose
-          sfx.hit();
-        } else if (gameMiss(cube, g, ch)) return;     // swung at nothing
-      }
-      if (o.wait > 0) { if (--o.wait === 0) spawnObj(g); return; }
-      o.x += o.dir * g.speed;
-      ch.facing = o.x >= ch.x ? 1 : -1;
-      if ((o.dir > 0 && o.x > ch.x + GAME_WINDOW) || (o.dir < 0 && o.x < ch.x - GAME_WINDOW)) {
-        const over = gameMiss(cube, g, ch);           // it clipped you
-        o.wait = irand(4, 8);
-        if (over) return;
-      }
+      if (g.bob > 0) g.bob--;
+      MECHANICS[g.kind].tick(cube, g, ch, pressed);
       return;
     }
     if (g.t >= GAME_OVER_HOLD) endGame(cube, true);   // 'over': hold, then bow out
@@ -1006,11 +1118,7 @@
       return;
     }
     if (g.phase === 'play') {
-      const o = g.obj;
-      if (o && o.wait === 0) {                        // the ball, 2x2
-        setOn(plane, o.x, FLOOR_Y - 2); setOn(plane, o.x + 1, FLOOR_Y - 2);
-        setOn(plane, o.x, FLOOR_Y - 1); setOn(plane, o.x + 1, FLOOR_Y - 1);
-      }
+      if (g.obj) MECHANICS[g.kind].draw(plane, g, ch);
       drawNum(plane, g.score, LCD - 1 - numWidth(g.score, 1), 1, 1);
       for (let m = 0; m < g.misses; m++) {            // miss pips, top-left
         setOn(plane, 1 + m * 3, 1); setOn(plane, 2 + m * 3, 2);
@@ -1115,7 +1223,8 @@
         (ch.state === 'transfer' && ch.transAxis === 'v' && ch.transPhase === 'cross'));
       const seq = CW_ANIM[ch.anim] || CW_ANIM.idle;
       const frameIndex = climbing && ch.clamber ? 21 : seq[clamp(ch.frame, 0, seq.length - 1)];
-      const baseY = FLOOR_Y + (ch.yOff || 0);
+      let baseY = FLOOR_Y + (ch.yOff || 0);
+      if (cube.game && cube.game.charId === ch.id && cube.game.bob) baseY -= 3;   // mid-hop
       blitFrame(plane, frameIndex, ch.x, baseY, ch.facing);
       if (ch.emote) blitIcon(plane, ch.emote.icon, ch.x, baseY - 24);
     }
@@ -1767,7 +1876,8 @@
       if (c.game) {
         const g = c.game;
         if (!['countdown', 'play', 'over'].includes(g.phase)) fail(`cube ${c.id}: game phase '${g.phase}'`);
-        for (const k of ['t', 'score', 'misses', 'speed'])
+        if (!MECHANICS[g.kind]) fail(`cube ${c.id}: unknown game kind '${g.kind}'`);
+        for (const k of ['t', 'score', 'misses', 'speed', 'bob'])
           if (!finite(g[k])) fail(`cube ${c.id}: game.${k} not finite (${g[k]})`);
         const p = chars.find(k => k.id === g.charId);
         if (!p || p.cubeId !== c.id || p.state !== 'gaming')

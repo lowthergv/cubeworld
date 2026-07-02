@@ -74,7 +74,7 @@ the game engine and cover the whole roster with our own LCD art.
   scripted button press at the right tick, miss on a wrong-tick press, and
   reach game-over; screen stays 32×32 authentic; selftest passes during and
   after a game.*
-- [ ] **P1.2 Timing-game batch** — Implement with the P1.1 primitive:
+- [x] **P1.2 Timing-game batch** — Implement with the P1.1 primitive:
   jump-rope (Whip: rope sweeps under feet, press to hop, speeds up), batting
   (Slugger: pitch approaches, press to swing, ball flies off), header
   (Dodger: ball drops from varying x, press when overhead).

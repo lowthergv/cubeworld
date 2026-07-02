@@ -5,6 +5,26 @@ verified, cache version after the change. Newest entries at the top.
 
 ---
 
+- **2026-07-02 · P1.2 Timing-game batch** — The play phase is now a
+  MECHANICS dispatch ({init,tick,draw} per kind); GAME_KIND maps tricks to
+  mechanics and P1.1's volley stays the default. Three real games, all our
+  own LCD art: **rope** (Whip — a rope sweep arcs overhead and skims the
+  feet once per cycle; hop on the beat, early jumps tangle you; cycle
+  shortens every 3 points; the figure visibly hops via a new game `bob`
+  draw offset — deliberately NOT yOff, which selftest reserves for hatch
+  travel), **bat** (Slugger — pitch flies in at chest height, swing renders
+  a level bat for 2 ticks, a crack sends the ball sailing up and away;
+  strikes on wild swings and called passes), **header** (Dodger — ball
+  drops from the sky near the player, nod it up in the head-row window,
+  falls faster as you score). Selftest: game.bob finite + known-kind
+  checks. Verified in-browser (?fresh=1): each game scripted to 5 points
+  with 0 misses, pace ramp confirmed (rope L 14→shorter, bat speed, header
+  fall speed), wrong-moment presses stumble and run each game to game-over
+  and clean end; three games running simultaneously screenshotted (rope
+  pass, jumbo-city batting, header drop all legible); selftest green
+  throughout; console clean. PR #2 (Phase 0) merged to main this session
+  (20f6a8d). Cache: main.js?v=19.
+
 - **2026-07-02 · P1.1 Game engine core** — Deck button 0 now starts a real
   interactive game on the cube (button 0 again quits; buttons 1/2 are game
   inputs — btn2 no longer sleeps during a game). `cube.game` state machine:
