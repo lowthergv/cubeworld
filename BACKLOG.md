@@ -64,7 +64,7 @@ unchecked item, implement it completely, verify it, log it, commit it.
 The real toy's heart: every character has a built-in 3-button game. We build
 the game engine and cover the whole roster with our own LCD art.
 
-- [ ] **P1.1 Game engine core** — `cube.game` state machine entered/exited
+- [x] **P1.1 Game engine core** — `cube.game` state machine entered/exited
   via deck button 0: countdown (3-2-1 on LCD), play, game-over. A 3×5 LCD
   digit font for score, rendered on the plane. A reusable "timing press"
   primitive (moving object + press window + hit/miss judgment). Miss = trip/
@@ -74,21 +74,21 @@ the game engine and cover the whole roster with our own LCD art.
   scripted button press at the right tick, miss on a wrong-tick press, and
   reach game-over; screen stays 32×32 authentic; selftest passes during and
   after a game.*
-- [ ] **P1.2 Timing-game batch** — Implement with the P1.1 primitive:
+- [x] **P1.2 Timing-game batch** — Implement with the P1.1 primitive:
   jump-rope (Whip: rope sweeps under feet, press to hop, speeds up), batting
   (Slugger: pitch approaches, press to swing, ball flies off), header
   (Dodger: ball drops from varying x, press when overhead).
   *Accept: each game playable to ≥5 points via scripted presses; distinct
   props; speed ramps; misses animate.*
-- [ ] **P1.3 Aim/sequence batch** — Fire hose (Sparky: flames pop up at
+- [x] **P1.3 Aim/sequence batch** — Fire hose (Sparky: flames pop up at
   three heights, btn1 cycles aim, btn0 sprays), snake charmer (Dart: the
   snake rises in a 2–4 step button pattern to mimic; wrong = snake ducks),
   rocket hover (Sci-Fi: btn0 thrusts against gravity through scrolling gaps).
   *Accept: each playable and losable via scripted inputs; selftest passes.*
-- [ ] **P1.4 High scores** — Per-character best score persisted with P0.2
+- [x] **P1.4 High scores** — Per-character best score persisted with P0.2
   storage; shown on the game-over toast and in the album (P3.1) later.
   *Accept: beat a score, reload, best survives.*
-- [ ] **P1.5 Full roster coverage** — Map every remaining roster character to
+- [x] **P1.5 Full roster coverage** — Map every remaining roster character to
   the nearest primitive (timing / aim / sequence / hover) with its own prop
   set from its documented game, so every character is playable.
   *Accept: iterate the whole ROSTER in a script: every char enters game mode
