@@ -49,7 +49,7 @@ unchecked item, implement it completely, verify it, log it, commit it.
   is bit-identical, (f) door values within 0..1, (g) ≤4 occupants per cube.
   *Accept: selftest passes on a fresh 4-cube world, after `__cw.ff(200)`, and
   after a scripted connect + transfer + disconnect sequence.*
-- [ ] **P0.2 Persistence** — Save sandbox to localStorage (debounced on
+- [x] **P0.2 Persistence** — Save sandbox to localStorage (debounced on
   change): cube positions, roster assignment, housing colors; restore on load.
   `?fresh=1` URL param skips restore; Reset clears the save. Version the
   schema (`cw_save_v1`).

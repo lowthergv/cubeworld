@@ -153,8 +153,8 @@
     return ch;
   }
 
-  function makeCube(x, y) {
-    const def = nextRoster();
+  function makeCube(x, y, def) {
+    def = def || nextRoster();
     const cube = {
       id: cubeSeq++,
       housing: def,            // full roster def carries colour + identity
@@ -296,9 +296,46 @@
     const cube = makeCube(jx, jy);
     recomputeConnections();
     resize();          // grow the sandbox if the grid pushed past the viewport
+    markDirty();
     return cube;
   }
   function initWorld() { for (let i = 0; i < 4; i++) addCube(); }
+
+  // ---------------------------------------------------- persistence (P0.2)
+  // The layout (cube positions + which roster unit each one is) survives a
+  // reload; character moment-to-moment state does not — the toys power back
+  // on at home, which is what the real cubes do. ?fresh=1 skips the save.
+  const SAVE_KEY = 'cw_save_v1';
+  const FRESH = new URLSearchParams(location.search).get('fresh') === '1';
+  let saveT = null;
+  function saveWorld() {
+    saveT = null;
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        v: 1,
+        cubes: cubes.map(c => ({ x: Math.round(c.x), y: Math.round(c.y), r: ROSTER.indexOf(c.housing) })),
+      }));
+    } catch (e) { /* storage unavailable (private mode) — play without saves */ }
+  }
+  // ?fresh=1 is a clean room: it never implicitly overwrites the saved world
+  // (only an explicit __cw.saveNow() does).
+  function markDirty() { if (FRESH) return; if (saveT) clearTimeout(saveT); saveT = setTimeout(saveWorld, 400); }
+  function clearSave() {
+    if (saveT) { clearTimeout(saveT); saveT = null; }
+    try { localStorage.removeItem(SAVE_KEY); } catch (e) {}
+  }
+  // rebuild the sandbox from a save; false = no/invalid save, caller inits fresh
+  function loadWorld() {
+    if (FRESH) return false;
+    try {
+      const s = JSON.parse(localStorage.getItem(SAVE_KEY));
+      if (!s || s.v !== 1 || !Array.isArray(s.cubes) || !s.cubes.length) return false;
+      if (!s.cubes.every(c => Number.isFinite(c.x) && Number.isFinite(c.y) && ROSTER[c.r])) return false;
+      for (const c of s.cubes) makeCube(Math.max(0, c.x), Math.max(0, c.y), ROSTER[c.r]);
+      recomputeConnections();
+      return true;
+    } catch (e) { return false; }
+  }
 
   // =========================================================== CHARACTER AI
   function setAnim(ch, name, oneShot) {
@@ -1393,6 +1430,7 @@
     if (ci >= 0) cubes.splice(ci, 1);
     recomputeConnections();
     dissolveOrphans();
+    markDirty();
     sfx.dissolve();
   }
 
@@ -1460,7 +1498,7 @@
     if (!drag) return;
     canvas.classList.remove('dragging');
     if (!drag.moved) pokeCube(drag.cube);
-    else { recomputeConnections(); dissolveOrphans(); }
+    else { recomputeConnections(); dissolveOrphans(); markDirty(); }
     drag = null;
   }
   canvas.addEventListener('pointerup', endDrag);
@@ -1481,6 +1519,7 @@
     // pointing at the live arrays after a reset.
     cubes.length = 0; chars.length = 0; cubeSeq = charSeq = 1; rosterBag = [];
     initWorld();
+    clearSave();      // reset wipes the save; the next interaction re-saves
   });
 
   // ------------------------------------------------------------------ boot
@@ -1516,7 +1555,8 @@
   }
 
   resize();
-  initWorld();
+  if (!loadWorld()) initWorld();
+  resize();           // grow the canvas to fit a restored layout
   requestAnimationFrame(tick);
 
   // ---- P0.1: in-page invariant selftest -----------------------------------
@@ -1619,6 +1659,7 @@
     addCube,
     poke: pokeCube,
     findSnap,
+    saveNow: saveWorld,
     forceTransfer: (charIdx, edge) => { const ch = chars[charIdx]; beginTransfer(ch, cubeById(ch.cubeId), edge); },
     startAct: (charIdx, key) => startAct(chars[charIdx], key),
     planeAscii: (cubeIdx) => {

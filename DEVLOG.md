@@ -5,6 +5,24 @@ verified, cache version after the change. Newest entries at the top.
 
 ---
 
+- **2026-07-02 · P0.2 Persistence** — Layout survives reload via
+  localStorage `cw_save_v1`: cube positions + roster identity (index into
+  ROSTER, so Special Editions / JP variants / jumbos restore exactly).
+  Debounced 400ms save on add/remove/drag-end; restore rebuilds cubes at
+  saved spots (power-on boot plays, characters start home — like the real
+  toy powering back up). `?fresh=1` is a clean room: skips restore AND
+  never implicitly saves, so peeking at a fresh world can't clobber the
+  saved one. Reset clears the save (with pending-timer cancel). makeCube
+  gained an optional def param; `__cw.saveNow` for tests. Verified
+  in-browser: exact signature restore (positions/names/series) with a
+  flush pair reconnecting; debounce fires without saveNow; fresh world
+  differs and leaves the save untouched >400ms later; return from fresh
+  restores the original; Reset clears now and stays cleared; post-reset
+  reload gives a new 4-cube world; selftest green at every step; console
+  clean. Note: restore clamps positions into the current viewport (same
+  rule as dragging), so a layout saved in a wider window reflows at the
+  right edge. Cache: main.js?v=17.
+
 - **2026-07-02 · P0.1 In-page selftest** (also closes P0.3) — Added
   `__cw.selftest()` to main.js: connection symmetry + flush seams, char
   home/cube resolution, occupant-list ↔ cubeId agreement, position sanity
